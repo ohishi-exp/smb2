@@ -504,7 +504,10 @@ struct Arrival {
 /// at the median against 137 ms (jitter up to 60 ms: 5% slower). Downloads
 /// correct only while the first flight lands, which is where slow start
 /// bites, and every throughput case in the simulator is unchanged. Uploads,
-/// measured on the benchmark grid that way, correct throughout.
+/// measured on the benchmark grid that way, correct throughout. Against
+/// Samba with slow start on, the same throughput and, at +200 ms / 10 MB/s, a
+/// side `stat` 38% shorter at the median
+/// (`benchmarks/read-ahead/results/download-drain.md`).
 ///
 /// # Learning the headroom
 ///

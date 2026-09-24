@@ -16,7 +16,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `tuning.rs` | `Tuning`, the window's tunables (headroom, rate measure) behind `Tuning::current()`; crate-private, re-exported as `smb2::__bench` under the unstable `__bench-tuning` feature |
 | `write_behind.rs` | `WriteBehind` (the upload knob), `UPLOAD_CHUNK_SIZE`, the one-frame write cut-off behind `Connection::quick_write_limit`, and what a WRITE's answer measures |
 | `write_pipe.rs` | `WritePipe`, the one engine every pipelined upload runs on: window, write budget, dispatch, confirmations, the upload rate hint |
-| `download_tests.rs` | `FileDownload` against the mock: order, short reads, EOF, errors, window bounds, cancel safety, adaptive timing on tokio's paused clock |
+| `download_tests.rs` | `FileDownload` against the mock: order, short reads, EOF, errors, window bounds, cancel safety, answers out of order, adaptive timing on tokio's paused clock |
 | `upload_tests.rs` | Uploads against the mock: chunk size, the cold window, adaptive timing, fixed windows, the upload rate hint and `quick_write_limit`, every write path pacing alike, `write_chunk` cancel safety |
 | `socket_lifecycle_tests.rs` | When the socket closes, over real loopback sockets: last clone dropped, server hang-up, `mark_dead` |
 | `smol_runtime_tests.rs` | The same connection on smol with no tokio runtime (`--features smol`): a NEGOTIATE + ECHO round trip against a `std::net` fake server, the response deadline, and the socket-lifetime cases. Every spawn, timer, and socket here goes through `crate::rt`; see `src/rt/CLAUDE.md` |

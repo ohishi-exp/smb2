@@ -97,3 +97,5 @@ writers finish a file in about 0.1 s, so there the lag is short.
   real-NAS validation (a QNAP over Wi-Fi) and its commands.
 - `stat-stall-diagnosis.md`: why a side `stat` on the QNAP sometimes outlasted a whole download (the server holds
   it; the window doesn't), 2026-09-24.
+- `download-drain.md`: downloads checking their drained estimate against the READs still unanswered, so a download
+  after an idle spell leaves no standing queue; before and after at +60 and +200 ms with slow start on, 2026-09-24.
