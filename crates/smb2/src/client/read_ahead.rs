@@ -213,6 +213,47 @@ pub(crate) enum Dispatch {
     AfterHead,
 }
 
+/// What a transfer still has out as it takes an answer: what
+/// [`Window::on_delivery`] corrects its estimate of what's still on its way
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Outstanding {
+    /// Requested but not yet delivered: what the window's memory bound counts.
+    pub(crate) bytes: u64,
+    /// The part of `bytes` whose answers haven't come off the wire yet, in
+    /// requests already sent. For a download it's less than `bytes` whenever
+    /// the server answered READs out of order, or the consumer is behind:
+    /// chunks are delivered in file order, so an answer that arrived early
+    /// waits until the ones ahead of it are taken.
+    pub(crate) unanswered: u64,
+    /// When the latest answer so far came off the wire, if any did besides
+    /// the one being delivered.
+    pub(crate) last_arrival: Option<Instant>,
+}
+
+impl Outstanding {
+    /// Everything still out is unanswered, as for an upload, which takes each
+    /// confirmation as it lands.
+    pub(crate) fn all_unanswered(bytes: u64) -> Self {
+        Self {
+            bytes,
+            unanswered: bytes,
+            last_arrival: None,
+        }
+    }
+}
+
+/// Which answers a [`Window`] checks its drained estimate of what's still on
+/// its way against. See `Window` § Closing the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Correction {
+    /// Answers to the first flight only: what the transfer sent before its
+    /// first answer landed. What downloads do.
+    FirstFlight,
+    /// Every answer. What uploads do.
+    Throughout,
+}
+
 /// The largest read worth making as one READ: what the link moves in
 /// [`QUICK_FRAME_BUDGET`] at `rate` bytes/s, never less than one download chunk and never
 /// more than `max_read`. Behind
@@ -437,6 +478,34 @@ struct Arrival {
 /// chunk's time on the wire, which on the slow links where an overestimate
 /// costs most is seconds.
 ///
+/// # Closing the loop
+///
+/// The drain is open-loop: it counts bytes as landed at the measured rate,
+/// whether or not they did. When the link starts slower than that rate (TCP
+/// restarting slow start after an idle spell, RFC 5681 § 4.1, which is on by
+/// default for real servers), it counts slow bytes as landed, the window
+/// sends a surplus, and nothing ever takes it back: the surplus stays queued
+/// for the rest of the transfer, ahead of everything else on the connection
+/// (1.5 MiB, a `stat` waiting ~520 ms, on a 3 MB/s uplink; 2.6 MB against a
+/// 690 KB target on a simulated 3 MB/s download at +200 ms). So an answer
+/// raises the estimate to at least what's still unanswered, less what the
+/// link could have carried since the latest answer landed ([`Outstanding`]).
+/// A download counts as unanswered only READs whose answer hasn't come off
+/// the wire, looking at every READ in flight, since chunks are delivered in
+/// file order and an answer Samba sent early would otherwise count as still
+/// on its way until the ones ahead of it are taken; correcting against that
+/// idled a reordering link.
+///
+/// Which answers do this is a trade ([`Correction`]). Mid-transfer, the
+/// same open-loop drain also counts a server freeze as time the link carried
+/// bytes, and the surplus it sends covers the next freeze. Correcting
+/// throughout takes that away: in the simulator, a download through 150 ms
+/// freezes every second at 20 MB/s ran 7% slower and a `stat` waited 56 ms
+/// at the median against 137 ms (jitter up to 60 ms: 5% slower). Downloads
+/// correct only while the first flight lands, which is where slow start
+/// bites, and every throughput case in the simulator is unchanged. Uploads,
+/// measured on the benchmark grid that way, correct throughout.
+///
 /// # Learning the headroom
 ///
 /// With [`Headroom::Learned`] (what ships), the margin comes from how late
@@ -532,9 +601,8 @@ pub(crate) struct Window {
     last_scored: Option<(Arrival, Duration)>,
     /// When this transfer's first answer landed.
     first_arrival: Option<Instant>,
-    /// Whether `bytes_in_flight` counts only requests not yet answered
-    /// (`with_unanswered_in_flight`).
-    in_flight_is_unanswered: bool,
+    /// Which answers correct `unarrived` against what's unanswered.
+    correction: Correction,
     /// When each request still in flight went out, oldest first.
     sent_in_flight: VecDeque<Instant>,
     /// `(when, total bytes delivered by then)`, oldest first. The first entry
@@ -575,7 +643,7 @@ impl Window {
             learned: false,
             last_scored: None,
             first_arrival: None,
-            in_flight_is_unanswered: false,
+            correction: Correction::FirstFlight,
             sent_in_flight: VecDeque::with_capacity(ADAPTIVE_MAX_REQUESTS),
             deliveries: VecDeque::with_capacity(RATE_SAMPLES + 1),
             delivered: 0,
@@ -584,18 +652,11 @@ impl Window {
         }
     }
 
-    /// Declare that the `bytes_in_flight` passed to `on_delivery` counts only
-    /// requests not yet answered, so the window can correct its open-loop
-    /// estimate of what's still on its way against it.
-    ///
-    /// True for uploads: `WritePipe` handles each confirmation as it comes.
-    /// Not for downloads: chunks are delivered in file order, so a READ that
-    /// Samba answered early still counts as in flight until the ones ahead of
-    /// it are taken, and correcting against that holds READs back on a
-    /// reordering server until the link really idles (the headroom then
-    /// learned 291 ms on a link that never needed any).
-    pub(crate) fn with_unanswered_in_flight(mut self) -> Self {
-        self.in_flight_is_unanswered = true;
+    /// Choose which answers correct the estimate of what's on its way
+    /// (§ Closing the loop). [`Correction::FirstFlight`] unless told
+    /// otherwise.
+    pub(crate) fn with_correction(mut self, correction: Correction) -> Self {
+        self.correction = correction;
         self
     }
 
@@ -651,32 +712,39 @@ impl Window {
     }
 
     /// A chunk of `len` bytes, requested at `dispatched_at` and arrived at
-    /// `arrived_at`, was delivered at `now`, leaving `bytes_in_flight`
-    /// requested but undelivered.
+    /// `arrived_at`, was delivered at `now`, leaving `outstanding` out.
     pub(crate) fn on_delivery(
         &mut self,
         now: Instant,
         dispatched_at: Instant,
         arrived_at: Instant,
         len: u32,
-        bytes_in_flight: u64,
+        outstanding: Outstanding,
     ) {
         self.drain(now);
-        // Everything delivered has arrived, so what's still on its way is at
-        // most what's still in flight.
-        self.unarrived = self.unarrived.min(bytes_in_flight as f64);
-        // And, where `bytes_in_flight` counts only unanswered requests, at
-        // least that less what the link could have carried since this answer
-        // landed. The drain alone is open-loop: when the link starts slower
-        // than the rate it assumes (TCP restarting slow start after an idle
-        // spell, another flow on the link), it counts bytes as landed that
-        // are still queued, and the window kept that surplus queued for good
-        // (1.5 MiB, a `stat` waiting ~520 ms, on a 3 MB/s uplink). See
-        // `with_unanswered_in_flight` for why downloads don't get it.
-        if let Some(rate) = self.rate().filter(|_| self.in_flight_is_unanswered) {
-            let since = now.saturating_duration_since(arrived_at).as_secs_f64();
-            self.unarrived = self.unarrived.max(bytes_in_flight as f64 - rate * since);
+        // Everything answered has arrived, so what's still on its way is at
+        // most what's still unanswered.
+        self.unarrived = self.unarrived.min(outstanding.unanswered as f64);
+        // And at least that less what the link could have carried since the
+        // latest answer landed: answers share one ordered stream, so no byte
+        // of a later one came in before it. See § Closing the loop.
+        let first_flight = self
+            .first_arrival
+            .is_none_or(|first| dispatched_at < first.min(arrived_at));
+        let correct = match self.correction {
+            Correction::Throughout => true,
+            Correction::FirstFlight => first_flight,
+        };
+        if let Some(rate) = self.rate().filter(|_| correct) {
+            let last = outstanding
+                .last_arrival
+                .map_or(arrived_at, |last| last.max(arrived_at));
+            let since = now.saturating_duration_since(last).as_secs_f64();
+            self.unarrived = self
+                .unarrived
+                .max(outstanding.unanswered as f64 - rate * since);
         }
+        let bytes_in_flight = outstanding.bytes;
 
         let landed = match self.tuning.rate {
             RateMeasure::Deliveries => now,
@@ -978,8 +1046,10 @@ mod tests {
     /// been ready during it until it ends; answers already ready keep
     /// flowing, as from a socket buffer. Answer `k` (in file order) is
     /// stamped `stamp_delay(k)` after it lands, as a receiver task that got
-    /// scheduled late would. The delays default to zero and there are no
-    /// freezes; the `with_*` builders set them.
+    /// scheduled late would. With a slow start, the link starts the download
+    /// slower and doubles its rate every round trip until it reaches `rate`.
+    /// The delays default to zero and there are no freezes or slow start; the
+    /// `with_*` builders set them.
     struct Link {
         rtt: Duration,
         rate: f64,
@@ -989,6 +1059,8 @@ mod tests {
         rate_wobble: Box<dyn Fn(usize) -> f64>,
         /// `(start, length)`, as offsets from the start of the download.
         freezes: Vec<(Duration, Duration)>,
+        /// The rate the link starts the download at, in bytes/s.
+        slow_start: Option<f64>,
     }
 
     struct Run {
@@ -1036,7 +1108,39 @@ mod tests {
                 stamp_delay: Box::new(|_| Duration::ZERO),
                 rate_wobble: Box::new(|_| 1.0),
                 freezes: Vec::new(),
+                slow_start: None,
             }
+        }
+
+        /// TCP restarting slow start after an idle spell (RFC 5681 § 4.1):
+        /// the download starts at `initial` bytes/s, and the rate doubles
+        /// every round trip until it reaches the link's.
+        fn with_slow_start(mut self, initial: f64) -> Self {
+            self.slow_start = Some(initial);
+            self
+        }
+
+        /// How long `bytes` take to cross, starting `from` into the download.
+        fn crossing(&self, from: Duration, bytes: f64) -> Duration {
+            let rtt = self.rtt.as_secs_f64();
+            let full = || Duration::from_secs_f64(bytes / self.rate);
+            let Some(initial) = self.slow_start.filter(|&i| i < self.rate && rtt > 0.0) else {
+                return full();
+            };
+            // The rate is `initial × 2^(t / rtt)` until it reaches the link's
+            // at `full_at`, so the bytes it carries from `s` to `e` are
+            // `k × (2^(e / rtt) − 2^(s / rtt))`.
+            let (s, full_at) = (from.as_secs_f64(), rtt * (self.rate / initial).log2());
+            if s >= full_at {
+                return full();
+            }
+            let k = initial * rtt / std::f64::consts::LN_2;
+            let ramp_bytes = k * ((full_at / rtt).exp2() - (s / rtt).exp2());
+            if bytes <= ramp_bytes {
+                let e = rtt * ((s / rtt).exp2() + bytes / k).log2();
+                return Duration::from_secs_f64(e - s);
+            }
+            Duration::from_secs_f64(full_at - s + (bytes - ramp_bytes) / self.rate)
         }
 
         /// Answer `i` (in send order) crosses the link at `rate × wobble(i)`.
@@ -1075,14 +1179,14 @@ mod tests {
         /// later is ready no earlier than half a round trip from its send, so
         /// re-running this after each send never moves an answer that has
         /// already started.
-        fn schedule(&self, reads: &mut [SimRead]) -> Instant {
+        fn schedule(&self, t0: Instant, reads: &mut [SimRead]) -> Instant {
             let mut order: Vec<usize> = (0..reads.len()).collect();
             order.sort_by_key(|&i| (reads[i].ready, i));
             let mut link_free = None::<Instant>;
             for i in order {
                 let starts = link_free.map_or(reads[i].ready, |f: Instant| f.max(reads[i].ready));
-                let rate = self.rate * (self.rate_wobble)(i);
-                let done = starts + Duration::from_secs_f64(f64::from(reads[i].len) / rate);
+                let bytes = f64::from(reads[i].len) / (self.rate_wobble)(i);
+                let done = starts + self.crossing(starts - t0, bytes);
                 reads[i].lands = done + self.rtt / 2;
                 link_free = Some(done);
             }
@@ -1147,7 +1251,7 @@ mod tests {
                         run.peak_reached_at = now - t0;
                     }
                     // What a request sent now would queue behind on the link.
-                    let link_free = self.schedule(reads);
+                    let link_free = self.schedule(t0, reads);
                     let queued = link_free.saturating_duration_since(now + self.rtt / 2);
                     let queued = (queued.as_secs_f64() * self.rate) as u64;
                     run.worst_queue = run.worst_queue.max(queued);
@@ -1162,17 +1266,31 @@ mod tests {
                     let Some(&head) = in_flight.front() else {
                         return run;
                     };
-                    self.schedule(&mut reads);
+                    self.schedule(t0, &mut reads);
                     match due {
                         Some(at) if at < reads[head].lands => now = at,
                         _ => break head,
                     }
                 };
                 in_flight.pop_front();
-                let arrived = reads[head].lands + (self.stamp_delay)(k);
+                let stamped = |i: usize| reads[i].lands + (self.stamp_delay)(i);
+                let arrived = stamped(head);
                 now = now.max(arrived);
-                let left = bytes_of(&in_flight, &reads);
-                window.on_delivery(now, reads[head].sent, arrived, reads[head].len, left);
+                // What `FileDownload::outstanding` sees: answers that came
+                // in early wait in their guards, and aren't on their way.
+                let mut outstanding = Outstanding {
+                    bytes: bytes_of(&in_flight, &reads),
+                    unanswered: 0,
+                    last_arrival: None,
+                };
+                for &i in &in_flight {
+                    if stamped(i) <= now {
+                        outstanding.last_arrival = outstanding.last_arrival.max(Some(stamped(i)));
+                    } else {
+                        outstanding.unanswered += u64::from(reads[i].len);
+                    }
+                }
+                window.on_delivery(now, reads[head].sent, arrived, reads[head].len, outstanding);
                 run.delivered_at.push(now - t0);
                 run.headroom.push(window.headroom());
                 if let Some(rate) = window.rate_to_share() {
@@ -1300,13 +1418,25 @@ mod tests {
         w.on_dispatch(now, CHUNK);
         for _ in 0..8 {
             now += 5 * MS;
-            w.on_delivery(now, now - 5 * MS, now, CHUNK, 0);
+            w.on_delivery(
+                now,
+                now - 5 * MS,
+                now,
+                CHUNK,
+                Outstanding::all_unanswered(0),
+            );
         }
         assert!(w.target().unwrap() >= ADAPTIVE_MAX_IN_FLIGHT);
         // Then the link drops to ~375 KB/s: a chunk every 1.4 s.
         for _ in 0..8 {
             now += Duration::from_millis(1_400);
-            w.on_delivery(now, now - 5 * MS, now, CHUNK, 0);
+            w.on_delivery(
+                now,
+                now - 5 * MS,
+                now,
+                CHUNK,
+                Outstanding::all_unanswered(0),
+            );
         }
         let rate = w.rate().unwrap();
         assert!((350e3..400e3).contains(&rate), "rate {rate}");
@@ -1330,12 +1460,24 @@ mod tests {
         w.on_dispatch(now, CHUNK);
         for _ in 0..8 {
             now += Duration::from_millis(1_400);
-            w.on_delivery(now, now - Duration::from_millis(1_400), now, CHUNK, 0);
+            w.on_delivery(
+                now,
+                now - Duration::from_millis(1_400),
+                now,
+                CHUNK,
+                Outstanding::all_unanswered(0),
+            );
         }
         assert!(w.target().unwrap() < u64::from(CHUNK));
         for _ in 0..8 {
             now += 5 * MS;
-            w.on_delivery(now, now - 5 * MS, now, CHUNK, 0);
+            w.on_delivery(
+                now,
+                now - 5 * MS,
+                now,
+                CHUNK,
+                Outstanding::all_unanswered(0),
+            );
         }
         assert!(w.target().unwrap() >= ADAPTIVE_MAX_IN_FLIGHT);
         // Seven READs out still leaves room for an eighth, and no more.
@@ -1354,7 +1496,7 @@ mod tests {
         // 1 MB/s steady.
         for _ in 0..8 {
             now += Duration::from_micros(524_288);
-            w.on_delivery(now, now, now, CHUNK, 0);
+            w.on_delivery(now, now, now, CHUNK, Outstanding::all_unanswered(0));
         }
         w.on_dispatch(now, CHUNK);
         let Dispatch::At(at) = w.decide(now, 1, u64::from(CHUNK), CHUNK) else {
@@ -1387,9 +1529,15 @@ mod tests {
             w.on_dispatch(sent, CHUNK);
             w.on_dispatch(sent, CHUNK);
             // The file-order-first READ is answered second; both are
-            // delivered as it lands.
-            w.on_delivery(late, sent, late, CHUNK, u64::from(CHUNK));
-            w.on_delivery(late, sent, early, CHUNK, 0);
+            // delivered as it lands. The other one is still out, but its
+            // answer is already in.
+            let answered_early = Outstanding {
+                bytes: u64::from(CHUNK),
+                unanswered: 0,
+                last_arrival: Some(early),
+            };
+            w.on_delivery(late, sent, late, CHUNK, answered_early);
+            w.on_delivery(late, sent, early, CHUNK, Outstanding::all_unanswered(0));
         }
         let rate = w.rate().unwrap();
         assert!((300e3..480e3).contains(&rate), "rate {rate}");
@@ -1403,7 +1551,13 @@ mod tests {
         let mut now = Instant::now();
         w.on_dispatch(now, CHUNK);
         now += Duration::from_millis(1_460);
-        w.on_delivery(now, now - Duration::from_millis(1_460), now, CHUNK, 0);
+        w.on_delivery(
+            now,
+            now - Duration::from_millis(1_460),
+            now,
+            CHUNK,
+            Outstanding::all_unanswered(0),
+        );
         assert_eq!(w.rtt(), Duration::from_millis(1_460));
     }
 
@@ -1448,7 +1602,7 @@ mod tests {
         let t0 = Instant::now();
         w.on_dispatch(t0, CHUNK);
         let t1 = t0 + Duration::from_millis(1_460);
-        w.on_delivery(t1, t0, t1, CHUNK, 0);
+        w.on_delivery(t1, t0, t1, CHUNK, Outstanding::all_unanswered(0));
         let rate = w.rate().unwrap();
         assert!((350e3..370e3).contains(&rate), "rate {rate}");
     }
@@ -1458,10 +1612,22 @@ mod tests {
         let mut w = adaptive(60 * MS);
         let t0 = Instant::now();
         w.on_dispatch(t0, CHUNK);
-        w.on_delivery(t0 + 70 * MS, t0, t0 + 70 * MS, CHUNK, 0);
+        w.on_delivery(
+            t0 + 70 * MS,
+            t0,
+            t0 + 70 * MS,
+            CHUNK,
+            Outstanding::all_unanswered(0),
+        );
         assert_eq!(w.rate_to_share(), None, "one READ is mostly its round trip");
         w.on_dispatch(t0 + 70 * MS, CHUNK);
-        w.on_delivery(t0 + 140 * MS, t0 + 70 * MS, t0 + 140 * MS, CHUNK, 0);
+        w.on_delivery(
+            t0 + 140 * MS,
+            t0 + 70 * MS,
+            t0 + 140 * MS,
+            CHUNK,
+            Outstanding::all_unanswered(0),
+        );
         assert!(w.rate_to_share().is_some());
     }
 
@@ -2087,7 +2253,8 @@ mod tests {
             rate: Some(3e6),
             lateness: first.lateness_to_share(),
         };
-        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint).with_unanswered_in_flight();
+        let mut w =
+            Window::new(ReadAhead::Adaptive, CHUNK, hint).with_correction(Correction::Throughout);
         let run = link.download(&mut w, 8 << 20, CHUNK);
         assert_eq!(w.headroom(), learned().floor);
         let settled = run.queued[run.queued.len() - 8..].iter().max().unwrap();
@@ -2096,6 +2263,50 @@ mod tests {
             "still queues {settled} bytes, headroom {:?}",
             w.headroom()
         );
+    }
+
+    /// TCP's initial window (RFC 6928: ten segments), what a connection
+    /// restarting slow start after an idle spell sends in its first round
+    /// trip.
+    const INITIAL_WINDOW: f64 = 14_600.0;
+
+    #[test]
+    fn a_download_that_starts_in_slow_start_leaves_no_standing_queue() {
+        // The connection's last download measured the link and found it
+        // quiet. This one starts after an idle spell, so TCP restarts slow
+        // start (RFC 5681 § 4.1): the link starts at one initial window per
+        // round trip and doubles every round trip, taking 4–9 of them to reach
+        // the link's rate. The window opens on the hint's rate, and draining
+        // what's on its way at that rate alone counts the slow bytes as
+        // landed: the surplus it sends then stays queued for the rest of the
+        // file (at 3 MB/s, 868 KB against a 270 KB target at +60 ms, and
+        // 2.6 MB against 690 KB at +200 ms). What queues behind the first
+        // flight is the hint's to answer for; once the link has ramped, a
+        // request should wait behind the target and the chunk just sent.
+        let mut standing = Vec::new();
+        for rtt in [60 * MS, 200 * MS] {
+            for rate in [3e6, 10e6, 30e6] {
+                let mut first = adaptive(rtt);
+                Link::new(rtt, rate).download(&mut first, 16 << 20, CHUNK);
+                let hint = LinkHint {
+                    rtt: Some(rtt),
+                    rate: first.rate_to_share(),
+                    lateness: first.lateness_to_share(),
+                };
+                let link = Link::new(rtt, rate).with_slow_start(INITIAL_WINDOW / rtt.as_secs_f64());
+                let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+                let run = link.download(&mut w, 16 << 20, CHUNK);
+                let bound = w.target().unwrap() + u64::from(CHUNK);
+                let settled = run.queued[run.queued.len() / 2..].iter().max().unwrap();
+                if *settled > bound {
+                    standing.push(format!(
+                        "+{rtt:?} at {} MB/s: {settled} bytes queued, bound {bound}",
+                        rate / 1e6
+                    ));
+                }
+            }
+        }
+        assert!(standing.is_empty(), "standing queues: {standing:?}");
     }
 
     #[test]

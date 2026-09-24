@@ -33,10 +33,11 @@
 //! `stat` waits behind an upload (70 ms against 142 ms, same throughput,
 //! `results/self-tuning.md`), and at 3 MB/s / +60 ms a `stat` waits 161 ms
 //! where 0.25.1's waited 343. An upload corrects what it estimates is still on
-//! its way against the WRITEs actually unconfirmed
-//! (`Window::with_unanswered_in_flight`): without that, the first WRITEs
-//! after an idle spell, crossing in TCP slow start, left a surplus queued for
-//! the rest of the file (1.5 MiB, a `stat` waiting ~520 ms).
+//! its way against the WRITEs actually unconfirmed, on every confirmation
+//! (`Correction::Throughout`; `Window` § Closing the loop): without that, the
+//! first WRITEs after an idle spell, crossing in TCP slow start, left a
+//! surplus queued for the rest of the file (1.5 MiB, a `stat` waiting
+//! ~520 ms). A download does the same only while its first flight lands.
 //!
 //! # Why adaptive is the default
 //!

@@ -97,17 +97,42 @@ pub(crate) struct WaiterGuard {
     /// Taken when the response is claimed; `None` afterwards so `Drop` knows
     /// there is nothing left to clean up.
     rx: Option<oneshot::Receiver<Routed>>,
-    /// When the response's frame came off the wire, once it has been claimed.
+    /// A response [`has_landed`](Self::has_landed) took off `rx` and nobody
+    /// has claimed yet. Every way of claiming one looks here first.
+    landed: Option<Routed>,
+    /// When the response's frame came off the wire, once it has landed.
     arrived_at: Option<rt::Instant>,
 }
 
 impl WaiterGuard {
-    /// When the claimed response's frame came off the wire: stamped by the
-    /// receiver task as it read the frame, however long the caller took to
-    /// look. `None` until a response has been claimed, and for an error that
-    /// never arrived (the connection died under it).
+    /// When the response's frame came off the wire: stamped by the receiver
+    /// task as it read the frame, however long the caller took to look.
+    /// `None` until a response has been claimed or seen by
+    /// [`has_landed`](Self::has_landed), and for an error that never arrived
+    /// (the connection died under it).
     pub(crate) fn arrived_at(&self) -> Option<rt::Instant> {
         self.arrived_at
+    }
+
+    /// Whether the response has been routed here, without claiming it: it
+    /// waits in the guard for [`recv`](Self::recv) or
+    /// [`try_recv`](Self::try_recv), and [`arrived_at`](Self::arrived_at)
+    /// says when it came in. Synchronous and idempotent, so a caller can ask
+    /// about every request it has out without anything to cancel.
+    ///
+    /// For a read-ahead [`FileDownload`](crate::FileDownload), which takes
+    /// chunks in file order and so hears of an answer the server sent early
+    /// only once the ones ahead of it are taken.
+    pub(crate) fn has_landed(&mut self) -> bool {
+        if self.landed.is_none() {
+            if let Some(Ok(routed)) = self.rx.as_mut().map(oneshot::Receiver::try_recv) {
+                // Spent: a oneshot polled again after its value panics.
+                self.rx = None;
+                self.arrived_at = routed.arrived_at;
+                self.landed = Some(routed);
+            }
+        }
+        self.landed.is_some()
     }
 
     fn claim(&mut self, routed: Routed) -> Result<Frame> {
@@ -139,6 +164,9 @@ impl WaiterGuard {
     /// parked long enough" and "drop the guard" is a real answer, and throwing
     /// it away would turn a routine handover into lost events.
     pub(crate) fn try_recv(&mut self) -> Option<Result<Frame>> {
+        if let Some(routed) = self.landed.take() {
+            return Some(self.claim(routed));
+        }
         let rx = self.rx.as_mut()?;
         match rx.try_recv() {
             Ok(routed) => Some(self.claim(routed)),
@@ -152,6 +180,9 @@ impl WaiterGuard {
     /// Takes `&mut self` on purpose: the guard, not the future, owns the map
     /// entry, so a caller whose future is dropped mid-await still deregisters.
     pub(crate) async fn recv(&mut self) -> Result<Frame> {
+        if let Some(routed) = self.landed.take() {
+            return self.claim(routed);
+        }
         let Some(rx) = self.rx.as_mut() else {
             return Err(Error::Disconnected);
         };
@@ -4269,6 +4300,7 @@ impl Connection {
             msg_id,
             generation: self.inner.revivals.load(Ordering::Acquire),
             rx: Some(rx),
+            landed: None,
             arrived_at: None,
         })
     }

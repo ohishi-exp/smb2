@@ -3,14 +3,15 @@
 //! timing, and the rate hint a download leaves on its connection.
 //!
 //! The mock answers READs in the order they were sent (FIFO pairing), so a
-//! test controls what each READ gets by the order it queues responses. Tests
+//! test controls what each READ gets by the order it queues responses; one
+//! addressed to a READ's `MessageId` (`read_answer_for`) answers out of order. Tests
 //! about timing run on tokio's paused clock, so "the READ took a second" is
 //! exact and costs no wall time.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::client::read_ahead::Window;
+use crate::client::read_ahead::{Outstanding, Window};
 use crate::client::stream::{FileDownload, ReadAhead};
 use crate::client::test_helpers::{
     build_close_error_response, build_close_response, build_read_error_response,
@@ -251,6 +252,89 @@ async fn dropping_next_chunk_while_a_read_is_out_loses_nothing() {
     // Still in order and complete, with no READ sent twice.
     assert_eq!(chunks, (1..=3u8).map(chunk_of).collect::<Vec<_>>());
     assert_eq!(sent_reads(&mock).len(), 3);
+}
+
+/// `MessageId`s of every READ the mock saw, in send order.
+fn sent_read_ids(mock: &MockTransport) -> Vec<u64> {
+    mock.sent_messages()
+        .iter()
+        .filter_map(|bytes| Header::unpack(&mut ReadCursor::new(bytes)).ok())
+        .filter(|header| header.command == Command::Read)
+        .map(|header| header.message_id.0)
+        .collect()
+}
+
+/// A READ answer addressed to `msg_id`, so it can come back out of order.
+fn read_answer_for(msg_id: u64, data: Vec<u8>) -> Vec<u8> {
+    let mut answer = build_read_response(data);
+    answer[24..32].copy_from_slice(&msg_id.to_le_bytes());
+    answer
+}
+
+#[tokio::test]
+async fn answers_that_land_out_of_order_are_seen_without_being_taken() {
+    // What the window corrects its estimate against: READs whose answers
+    // haven't come off the wire. Chunks are delivered in file order, so an
+    // answer the server sent early waits behind the head, and it has to count
+    // as arrived (Samba answers concurrent READs in whatever order its disk
+    // gives them up). Looking must not take it: it's still the next chunks.
+    let mock = Arc::new(MockTransport::new());
+    let mut conn = setup_connection(&mock);
+    // Keep every id nonzero, so the mock routes each answer to the id it names.
+    conn.set_next_message_id(100);
+    let tree = test_tree();
+    let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 4 * 65536, CHUNK)
+        .with_read_ahead(ReadAhead::Fixed(4));
+
+    let pending = tokio::time::timeout(Duration::from_millis(50), download.next_chunk()).await;
+    assert!(pending.is_err(), "nothing was answered yet");
+    let ids = sent_read_ids(&mock);
+    assert_eq!(ids.len(), 4);
+    let everything = 4 * u64::from(CHUNK);
+    let outstanding = download.outstanding();
+    assert_eq!(
+        (
+            outstanding.bytes,
+            outstanding.unanswered,
+            outstanding.last_arrival
+        ),
+        (everything, everything, None)
+    );
+
+    // READ 3 is answered, then READ 2: neither is the head.
+    mock.queue_response(read_answer_for(ids[2], chunk_of(3)));
+    mock.queue_response(read_answer_for(ids[1], chunk_of(2)));
+    let mut outstanding = download.outstanding();
+    for _ in 0..100 {
+        if outstanding.unanswered < everything - u64::from(CHUNK) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        outstanding = download.outstanding();
+    }
+    assert_eq!(outstanding.bytes, everything, "still undelivered");
+    assert_eq!(
+        outstanding.unanswered,
+        2 * u64::from(CHUNK),
+        "READs 1 and 4 are the only ones still on their way"
+    );
+    assert!(outstanding.last_arrival.is_some());
+    assert_eq!(
+        download.outstanding().unanswered,
+        2 * u64::from(CHUNK),
+        "looking again changes nothing"
+    );
+
+    // The rest arrive, and every chunk comes out in file order, intact.
+    mock.queue_response(read_answer_for(ids[0], chunk_of(1)));
+    mock.queue_response(read_answer_for(ids[3], chunk_of(4)));
+    mock.queue_response(build_close_response());
+    let mut chunks = Vec::new();
+    while let Some(chunk) = download.next_chunk().await {
+        chunks.push(chunk.unwrap());
+    }
+    assert_eq!(chunks, (1..=4u8).map(chunk_of).collect::<Vec<_>>());
+    assert_eq!(sent_reads(&mock).len(), 4, "no READ sent twice");
 }
 
 // ── Closing ────────────────────────────────────────────────────────────
@@ -556,13 +640,19 @@ async fn a_learned_headroom_leaves_the_quick_read_limit_alone() {
     let t0 = tokio::time::Instant::now();
     window.on_dispatch(t0, CHUNK);
     let t1 = t0 + Duration::from_millis(5);
-    window.on_delivery(t1, t0, t1, CHUNK, 0);
+    window.on_delivery(t1, t0, t1, CHUNK, Outstanding::all_unanswered(0));
     for _ in 0..64 {
         window.on_dispatch(t1, CHUNK);
     }
     for i in 0..64u64 {
         let at = t1 + Duration::from_millis(5 + i);
-        window.on_delivery(at, t1, at, CHUNK, (63 - i) * u64::from(CHUNK));
+        window.on_delivery(
+            at,
+            t1,
+            at,
+            CHUNK,
+            Outstanding::all_unanswered((63 - i) * u64::from(CHUNK)),
+        );
     }
     conn.note_read(&window);
     assert!(

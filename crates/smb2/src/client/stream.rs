@@ -17,7 +17,7 @@ use log::{debug, trace};
 
 use crate::client::connection::{Connection, Frame, WaiterGuard};
 use crate::client::credits;
-use crate::client::read_ahead::{Dispatch, Window};
+use crate::client::read_ahead::{Dispatch, Outstanding, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
 use crate::client::tree::{close_outcome, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
@@ -408,18 +408,46 @@ impl<'a> FileDownload<'a> {
             self.in_flight_bytes += u64::from(rest);
         }
         self.bytes_received += u64::from(got);
-        let in_flight_bytes = self.in_flight_bytes;
+        let outstanding = self.outstanding();
         self.window().on_delivery(
             Instant::now(),
             head.dispatched_at,
             arrived_at,
             got,
-            in_flight_bytes,
+            outstanding,
         );
         if let Some(window) = &self.window {
             self.conn.note_read(window);
         }
         Ok(Some(data))
+    }
+
+    /// What's still out, READ by READ: which answers have come off the wire
+    /// and which haven't. Looks at every guard without claiming its answer,
+    /// which waits there until its chunk is taken.
+    ///
+    /// The head alone can't say: chunks are delivered in file order, so a
+    /// READ Samba answered early looks unanswered until the ones ahead of it
+    /// are taken, and correcting the window against that held READs back on a
+    /// reordering link until it idled.
+    pub(super) fn outstanding(&mut self) -> Outstanding {
+        let mut outstanding = Outstanding {
+            bytes: self.in_flight_bytes,
+            unanswered: 0,
+            last_arrival: None,
+        };
+        for read in &mut self.in_flight {
+            // The rest of a short read not yet re-requested isn't out at all.
+            let Some(guard) = read.guard.as_mut() else {
+                continue;
+            };
+            if !guard.has_landed() {
+                outstanding.unanswered += u64::from(read.len);
+            } else if let Some(at) = guard.arrived_at() {
+                outstanding.last_arrival = outstanding.last_arrival.max(Some(at));
+            }
+        }
+        outstanding
     }
 
     fn window(&mut self) -> &mut Window {

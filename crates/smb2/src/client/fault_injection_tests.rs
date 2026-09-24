@@ -29,7 +29,7 @@ use tokio::sync::Notify;
 use crate::client::connection::{
     pack_message, Connection, ReconnectEvent, ReconnectPolicy, SessionReviver,
 };
-use crate::client::read_ahead::{ReadAhead, Window};
+use crate::client::read_ahead::{Outstanding, ReadAhead, Window};
 use crate::error::{Error, Result};
 use crate::msg::echo::EchoResponse;
 use crate::msg::header::Header;
@@ -1378,7 +1378,7 @@ async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
     let mut window = Window::new(ReadAhead::Adaptive, 65536, conn.read_link_hint());
     let t0 = tokio::time::Instant::now();
     window.on_dispatch(t0, 65536);
-    window.on_delivery(t0, t0, t0, 65536, 0);
+    window.on_delivery(t0, t0, t0, 65536, Outstanding::all_unanswered(0));
     conn.note_read(&window);
     assert!(conn.read_link_hint().lateness.is_some());
     assert!(finish(spawn_write(&conn), "the warm-up write")
