@@ -6,9 +6,13 @@ waited at least 80% of the ~600 ms transfer, where a 4 MiB window at ~55 MB/s sh
 **Verdict: the server holds the `stat`; the download doesn't.** Every slow `stat` but one is class (b). The `smbd`
 serving that connection sits blocked in the kernel (state `D`) for the whole wait while the download's READs keep
 flowing, including READs sent long after the `stat`. The same stalls hit a `stat` with no download running at all, and
-a connection that only sends ECHOs never stalls, so it's the metadata operation itself that blocks on this busy server.
-The read-ahead window does exactly what it should: every `stat` that wasn't held waited at most 109 ms, behind at most
-4 MiB. One slow `stat` in 400 was class (d), a client-side scheduling delay worth a small, separate fix.
+a connection that only sends ECHOs never stalls, so it's the metadata operation itself that blocks on this server.
+The server's load sets how often it happens: with the photo app paused, the rate of `stat`s over 300 ms fell about
+5× (2.9% to 0.6%) and no download had a bad run (0 of 20, against 10 of 60). The stalls didn't go away, though, and
+the longest got no shorter (5.7 s), so the photo app amplifies them without being their only cause.
+The read-ahead window does exactly what it should: every `stat` that wasn't held waited at most 109 ms (127 ms on the
+idle NAS's slower link), behind at most 4 MiB. One slow `stat` in 400 was class (d), a client-side scheduling delay
+worth a small, separate fix.
 
 ## Rig
 
@@ -155,6 +159,41 @@ All 400 probes resumed on the worker that routed their answer, normally within 2
   coop budget makes it yield after 128 socket reads, and at several reads per 512 KiB frame that is tens of frames: on
   a client slow enough that the socket never drains, most of a download.
 
+## With the photo app paused
+
+David paused every job queue of the NAS's photo app, and the same controls and a traced download batch ran again on
+the quieter server.
+
+**Conditions.** The NAS's 1-minute load fell from ~10 to ~2.2 within 3 minutes, `top` showed no photo-app or ML
+process using CPU (the processes stayed up, idle), the CPU was 60–90% idle, and the HDD pool went from ~50–100
+reads/s to none. During the runs the load sat at 2–5 (a blocked `smbd` counts toward it too). The laptop was on a
+better Wi-Fi spot: MCS 8, 432 Mbit/s transmit rate, −67 dBm, pings 3.4 ms average (worst 7.6–28 ms per run, none
+lost); downloads ran at 40–45 MB/s. The wired Pi's pings to the NAS stayed under 1.8 ms, none lost.
+
+**Controls, no download (three 60 s runs, a `stat` and an ECHO on each of two connections):**
+
+- **`stat`s over 300 ms:** 67 of 10,597 (0.63%; per connection-run 0.34–1.03%), against 254 of 8,632 (2.9%) across
+  the five comparable busy runs. Max 5.7 s, against 4.4 s busy.
+- **Same shape as busy:** every stall hit the ECHO on the same connection too, often both connections at once, with no
+  ping loss and no ping over 28 ms.
+- **ECHO-only connection:** max 23.7 ms over 2,245 ECHOs, none over 100 ms, while the `stat` connection beside it had
+  3 of 2,123 over 300 ms (max 1.2 s). Busy: 1 of 2,250 against 38 of 705.
+- **`D` state:** 9.8% and 31.0% of the bench `smbd`s' samples in two runs (the sampler missed the processes in the
+  third), against 58.7% busy. In the ECHO-only run, the ECHO connection's `smbd` was in `D` for 1.0% of samples and
+  the `stat` connection's for 4.8%.
+
+**Traced downloads (10 runs each of `adaptive:shipping` and `adaptive:ref`, 32 MiB, 192 side `stat`s):**
+
+- **Bad runs:** 0 of 20, against 10 of 60 busy. The longest `stat` took 200 ms (busy: 2.9 s).
+- **Classes:** 191 class (c), max 127 ms behind 4 MiB (4 MiB takes ~95 ms at 44 MB/s). One class (b) at 200 ms: the
+  run's first probe, sent with the download's open, answered with the wire idle and no `smbd` in `D` in its 7 samples.
+- **`D` state over the whole batch:** 4.4% of samples, against 10.4% in the busy 40-run batch.
+
+**What it changes.** The photo app's load multiplies the stall rate about 5× and is what made the stalls show up in
+a third of the downloads. It isn't the whole cause: a quiet NAS still blocks a `stat`'s `smbd` in the kernel for up
+to several seconds, just rarely enough (~0.6% of `stat`s) that 20 downloads with ~10 probes each missed it. An ECHO
+still never stalls, so it's still the file operation.
+
 ## What's still unknown
 
 - **What `smbd` waits on in the kernel.** Without root, `/proc/<pid>/stack` and `wchan` are hidden. The leading
@@ -163,8 +202,10 @@ All 400 probes resumed on the worker that routed their answer, normally within 2
   database, and in one 60 s run most long stalls spanned one of that pool's ~5-second write bursts (transaction group
   syncs). Suggestive, not proven: some stalls didn't. Root on the NAS during a stall (`cat /proc/<pid>/stack`) would
   settle it.
-- **Whether an idle NAS shows it at all.** Every run here had the photo app indexing. Docker Samba never showed it,
-  which fits a server-load cause.
+- **What still stalls a quiet NAS.** With the photo app paused, stalls fell ~5× but kept their length (up to 5.7 s).
+  The NAS still runs other services (media servers, databases, the system pool's periodic writes), and none was
+  paused, so it's open whether a truly idle QNAP stalls at all. Docker Samba never has. That makes the per-open write
+  path (the ZFS suspect above) more likely than anything specific to the photo app.
 - **Why READs flow while `smbd` is blocked:** QNAP's kernel data path (`ksmbd` threads, `server kernel smbd support`)
   is the likely reason, but that's inferred from config and process names only.
 - **Class (d)'s mechanism** is inferred from one occurrence and tokio's documented behavior, not reproduced in
@@ -176,7 +217,8 @@ All 400 probes resumed on the worker that routed their answer, normally within 2
    smaller cap would only shorten class (c), which isn't the problem. A dedicated transfer session (Cmdr #133) wouldn't
    help either: the `stat` stalls on a connection with no transfer on it.
 2. **Treat it as server latency in Cmdr.** On this NAS under its own load, any metadata operation (listing, `stat`,
-   open) can take 0.3–3 s, 2–5% of the time, with or without a transfer. The UI shouldn't block on one, and nothing
+   open) can take 0.3–3 s, 2–5% of the time, with or without a transfer (~0.6% with the photo app paused, still up to
+   5.7 s). The UI shouldn't block on one, and nothing
    should read it as a dead connection. The crate already doesn't: stalls stay far below the 5 s keepalive threshold
    and the 30 s response deadline. Note that an ECHO on the stalled connection waits too.
 3. **Make the bench tell the two apart.** `probe_max` on a real NAS mostly measures the server's tail. Report the
