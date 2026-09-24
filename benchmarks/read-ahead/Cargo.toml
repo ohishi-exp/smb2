@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 smb2 = { path = "../../crates/smb2", features = ["__bench-tuning"] }
+log = { version = "0.4", features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Standalone: this sits under the main clone when checked out as a worktree.

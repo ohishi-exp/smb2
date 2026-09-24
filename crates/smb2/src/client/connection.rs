@@ -488,6 +488,15 @@ struct WriteJob {
     done: oneshot::Sender<Result<()>>,
 }
 
+/// The `MessageId` of a plain frame's first request, for the writer's `TRACE`
+/// line; `None` for an encrypted or compressed frame, whose header is opaque.
+fn first_message_id(frame: &[u8]) -> Option<u64> {
+    if frame.len() < 32 || frame[0..4] != [0xFE, b'S', b'M', b'B'] {
+        return None;
+    }
+    Some(u64::from_le_bytes(frame[24..32].try_into().ok()?))
+}
+
 /// The end of one socket's life, shared by the two tasks that hold its halves.
 ///
 /// The writer task and the receiver task each own a handle to the same
@@ -608,8 +617,9 @@ async fn writer_loop(
             strong.send_tally.record(len, queued_for, wrote_in);
         }
         trace!(
-            "send: cmd={:?}, {} bytes, {:?} queued + {:?} writing",
+            "send: cmd={:?}, msg_id={}, {} bytes, {:?} queued + {:?} writing",
             job.command,
+            first_message_id(&job.bytes).map_or_else(|| "?".to_string(), |id| id.to_string()),
             len,
             queued_for,
             wrote_in
@@ -5660,10 +5670,12 @@ async fn receiver_loop(
                     // and a real signal. See AGENTS.md § Logging.
                     match &result {
                         Ok(frame) => trace!(
-                            "recv: routed msg_id={}, status={:?}, cmd={:?}",
+                            "recv: routed msg_id={}, status={:?}, cmd={:?}, credits_granted={}, len={}",
                             msg_id.0,
                             frame.header.status,
-                            frame.header.command
+                            frame.header.command,
+                            frame.header.credits,
+                            frame.raw.len()
                         ),
                         Err(e) => debug!("recv: routed error msg_id={}, err={}", msg_id.0, e),
                     }

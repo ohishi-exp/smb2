@@ -27,6 +27,13 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
   candidate learns never seeds another. Tuned variants rotate their order every run. Names are in `src/tuning.rs`:
   `shipping` is what the build ships, `ref` is 0.25.1's behavior (fixed 250 ms headroom, delivery-paced rate).
 - `./target/release/read-ahead-bench summarize OUT.csv`: median tables in Markdown.
+- **Why a side `stat` was slow**: `run --trace-dir DIR` logs smb2's `TRACE` lines and every probe into one file per
+  run (and, when a probe takes over 100 ms, where it is: `outstanding` with `sent_age`, credits, the send queue).
+  `timeline [--detail] [--min-ms N] DIR/*.log` turns them into a row per probe: time to the wire, time to the answer,
+  the READs ahead of it and after it, the bytes that arrived meanwhile, and a class (credits, the server holding it,
+  head-of-line, client scheduling, the link). `--nas` and `--ping` add the server's `smbd` state
+  (`server-sample.sh`) and a ping log. `probe --secs N [--a-echo-only]` is the control: a `stat` and an ECHO on each of
+  two connections, with no download. `results/stat-stall-diagnosis.md` uses all three.
 - Variants:
   - `baseline`: sequential, chunk = `MaxReadSize` (what `Tree::download` did before 0.24.0).
   - `adaptive`: 512 KiB chunks, `ReadAhead::Adaptive` (the default since 0.24.0), on the connection the previous
@@ -88,3 +95,5 @@ writers finish a file in about 0.1 s, so there the lag is short.
 - `self-tuning.md`: ten headroom and rate candidates on a grid of 28 shaped links (RTT, bandwidth, jitter, server
   stalls, background writers, uploads), picked by minimax regret, 2026-09-24. Samba 4.23 on Alpine 3.24. Also the
   real-NAS validation (a QNAP over Wi-Fi) and its commands.
+- `stat-stall-diagnosis.md`: why a side `stat` on the QNAP sometimes outlasted a whole download (the server holds
+  it; the window doesn't), 2026-09-24.

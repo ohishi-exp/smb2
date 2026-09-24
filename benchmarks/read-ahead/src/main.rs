@@ -13,8 +13,26 @@ use std::time::{Duration, Instant};
 use smb2::{ClientConfig, FileDownload, ReadAhead, SmbClient};
 
 mod score;
+mod timeline;
+mod trace;
 mod tuning;
 mod upload;
+
+/// `--trace-dir` is set: log every probe and dump a timeline per run.
+static TRACING: AtomicBool = AtomicBool::new(false);
+
+/// How long a side `stat` may take before the probe records where it is.
+const STUCK_AFTER: Duration = Duration::from_millis(100);
+
+/// The counters that say whether a run waited on credits or the clock.
+fn counters(c: &smb2::client::Connection) -> String {
+    let d = c.diagnostics();
+    let m = &d.metrics;
+    format!(
+        "credit_waits={} credit_starvations={} scheduling_stalls={} status_pending_loops={} keepalive_probes_sent={} credits_available={} rtt_estimate={:?}",
+        m.credit_waits, m.credit_starvations, m.scheduling_stalls, m.status_pending_loops, m.keepalive_probes_sent, d.credits.available, d.rtt_estimate
+    )
+}
 
 /// Share, username, and password, from `SMB_BENCH_SHARE` / `SMB_BENCH_USER` /
 /// `SMB_BENCH_PASS`. Defaults are the guest fixture's.
@@ -135,10 +153,45 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, size_hin
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut lat = Vec::new();
+            let mut seq = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let s = Instant::now();
-                t.stat(&mut c, "bench/f_65536.bin").await.expect("probe stat");
+                if TRACING.load(Ordering::Relaxed) {
+                    log::trace!(target: "bench", "probe start seq={seq}");
+                    let mut probe_conn = c.clone();
+                    let stat = t.stat(&mut probe_conn, "bench/f_65536.bin");
+                    tokio::pin!(stat);
+                    let r = tokio::select! {
+                        r = &mut stat => r,
+                        _ = tokio::time::sleep(STUCK_AFTER) => {
+                            // Where the stuck `stat` is: `sent_age: None` means
+                            // it never reached the wire.
+                            let d = c.diagnostics();
+                            let out: Vec<String> = d
+                                .outstanding
+                                .iter()
+                                .map(|o| format!("{:?}#{}:age={:?}:sent_age={:?}", o.command, o.message_id, o.age, o.sent_age))
+                                .collect();
+                            log::trace!(
+                                target: "bench",
+                                "probe stuck seq={seq} after={:?} credits_available={} in_flight={} send_queue={} inbound_frame={:?} outstanding=[{}]",
+                                s.elapsed(),
+                                d.credits.available,
+                                d.credits.in_flight,
+                                d.credits.send_queue_depth,
+                                d.inbound,
+                                out.join(" ")
+                            );
+                            stat.await
+                        }
+                    };
+                    r.expect("probe stat");
+                    log::trace!(target: "bench", "probe end seq={seq} lat_us={}", s.elapsed().as_micros());
+                } else {
+                    t.stat(&mut c, "bench/f_65536.bin").await.expect("probe stat");
+                }
                 lat.push(s.elapsed());
+                seq += 1;
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             lat
@@ -150,6 +203,7 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, size_hin
         Fetch::Auto => size_hint <= conn.quick_read_limit(),
         Fetch::Stream => false,
     };
+    log::trace!(target: "bench", "download start compound={compound} size={size_hint}");
     let t0 = Instant::now();
     let mut chunks = Vec::new();
     let mut last = t0;
@@ -177,6 +231,7 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, size_hin
         dl.peak_in_flight_bytes()
     };
     let wall = t0.elapsed();
+    log::trace!(target: "bench", "download end wall_us={} last_chunk_us={}", wall.as_micros(), (last - t0).as_micros());
     stop.store(true, Ordering::Relaxed);
     let mut lat = probe.await.unwrap();
     lat.sort();
@@ -282,6 +337,12 @@ async fn run(args: &[String]) {
             })
             .collect();
 
+    let trace_dir = args.iter().any(|a| a == "--trace-dir").then(|| arg(args, "--trace-dir", ""));
+    if let Some(dir) = &trace_dir {
+        std::fs::create_dir_all(dir).unwrap();
+        trace::install();
+        TRACING.store(true, Ordering::Relaxed);
+    }
     let mut client = connect(&addr).await;
     let mut tree = client.connect_share(&share()).await.expect("share");
     if args.iter().any(|a| a == "--prep") {
@@ -362,7 +423,28 @@ async fn run(args: &[String]) {
                         (c, &*t)
                     }
                 };
+                let before = trace_dir.as_ref().map(|_| counters(c.connection_mut()));
+                trace::drain();
                 let s = measure(c, t, &path, size, *v).await;
+                if let (Some(dir), Some(before)) = (&trace_dir, before) {
+                    let after = counters(c.connection_mut());
+                    let lines = trace::drain();
+                    let file = format!("{dir}/{size}-{}-{run}.log", name.replace(':', "_"));
+                    let mut tf = std::fs::File::create(&file).unwrap();
+                    writeln!(
+                        tf,
+                        "# size={size} variant={name} run={run} wall_ms={:.1} probe_max_ms={:.1} probe_p50_ms={:.1} peak_in_flight={}\n# before {before}\n# after  {after}\n# epoch_unix_us={}",
+                        s.wall.as_secs_f64() * 1000.0,
+                        s.probe_max.as_secs_f64() * 1000.0,
+                        s.probe_p50.as_secs_f64() * 1000.0,
+                        s.peak_in_flight,
+                        trace::epoch_unix_us()
+                    )
+                    .unwrap();
+                    for l in lines {
+                        writeln!(tf, "{l}").unwrap();
+                    }
+                }
                 let cancel = if size >= 8 << 20 && v.fetch == Fetch::Stream {
                     cancel_cost(c, t, &path, *v).await.as_secs_f64() * 1000.0
                 } else {
@@ -403,6 +485,87 @@ async fn run(args: &[String]) {
         let mut lf = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.load")).unwrap();
         writeln!(lf, "rtt_ms={rtt} writers={load_writers} load_mb_s={:.1}", bytes as f64 / 1e6 / secs).unwrap();
     }
+}
+
+/// `probe --secs N`: the side `stat` alone, every 20 ms, with no download
+/// running. The control for a slow `stat` during a download: how slow does the
+/// server answer one when nothing else is on the connection?
+///
+/// Four probes run side by side, each every 20 ms: a `stat` and an SMB2 ECHO
+/// on connection A, and the same pair on connection B. Samba serves each
+/// connection from its own `smbd` process, and an ECHO touches no file system,
+/// so for each slow `stat` on A the other three say where it stalled: an ECHO on
+/// A that stays quick means A's `smbd` kept serving; B's `stat` stalling too
+/// means the file system, not the process; every probe stalling at once means
+/// the link.
+async fn probe_only(args: &[String]) {
+    let addr = arg(args, "--addr", "127.0.0.1:17445");
+    let secs: u64 = arg(args, "--secs", "30").parse().unwrap();
+    // Connection A sends only ECHOs (both columns): does an `smbd` that never
+    // touches a file stall too?
+    let a_echo_only = args.iter().any(|a| a == "--a-echo-only");
+    let t0 = Instant::now();
+    // So the table lines up with a `ping` log from this or another machine.
+    let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    println!("t0 = {:.3} (Unix seconds)", epoch.as_secs_f64());
+    let deadline = Duration::from_secs(secs);
+    let mut tasks = Vec::new();
+    let mut clients = Vec::new();
+    for conn_index in 0..2 {
+        let mut client = connect(&addr).await;
+        let tree = client.connect_share(&share()).await.expect("share");
+        let conn = client.connection_mut().clone();
+        clients.push(client);
+        for echo in [a_echo_only && conn_index == 0, true] {
+            let mut c = conn.clone();
+            let t = tree.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut out = Vec::new();
+                while t0.elapsed() < deadline {
+                    let s = Instant::now();
+                    if echo {
+                        c.execute(smb2::types::Command::Echo, &smb2::msg::echo::EchoRequest, None).await.expect("echo");
+                    } else {
+                        t.stat(&mut c, "bench/f_65536.bin").await.expect("probe stat");
+                    }
+                    out.push((s.duration_since(t0).as_secs_f64() * 1000.0, s.elapsed().as_secs_f64() * 1000.0));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                out
+            }));
+        }
+    }
+    let mut series = Vec::new();
+    for t in tasks {
+        series.push(t.await.unwrap());
+    }
+    let names = ["stat A", "echo A", "stat B", "echo B"];
+    for (name, s) in names.iter().zip(&series) {
+        let mut lat: Vec<f64> = s.iter().map(|x| x.1).collect();
+        lat.sort_by(f64::total_cmp);
+        let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+        println!(
+            "{name}: {} samples, p50 {:.1} p90 {:.1} p99 {:.1} max {:.1} ms; ≥100 ms: {}, ≥300 ms: {}",
+            lat.len(),
+            p(0.5),
+            p(0.9),
+            p(0.99),
+            lat[lat.len() - 1],
+            lat.iter().filter(|&&x| x >= 100.0).count(),
+            lat.iter().filter(|&&x| x >= 300.0).count()
+        );
+    }
+    // For each slow `stat` on A: the worst latency each other probe saw among
+    // the samples that overlapped it.
+    println!("\n| stat A at ms | stat A ms | echo A worst ms | stat B worst ms | echo B worst ms |");
+    println!("|---:|---:|---:|---:|---:|");
+    for &(start, dur) in series[0].iter().filter(|x| x.1 >= 200.0) {
+        let worst = |s: &Vec<(f64, f64)>| {
+            s.iter().filter(|x| x.0 < start + dur && x.0 + x.1 > start).map(|x| x.1).fold(0.0, f64::max)
+        };
+        println!("| {start:.0} | {dur:.0} | {:.1} | {:.1} | {:.1} |", worst(&series[1]), worst(&series[2]), worst(&series[3]));
+    }
+    drop(clients);
 }
 
 pub(crate) fn median(mut v: Vec<f64>) -> f64 {
@@ -475,8 +638,18 @@ fn summarize(path: &str) {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
+    // Numbered workers, so a timeline shows which thread handled what.
+    let n = AtomicU64::new(0);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name_fn(move || format!("w{}", n.fetch_add(1, Ordering::Relaxed)))
+        .build()
+        .unwrap()
+        .block_on(dispatch());
+}
+
+async fn dispatch() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("run") => run(&args).await,
@@ -484,6 +657,8 @@ async fn main() {
         Some("upload") => upload::run(&args).await,
         Some("summarize-upload") => upload::summarize(&args[2]),
         Some("score") => score::run(&args[2..]),
+        Some("timeline") => timeline::run(&args[2..]),
+        Some("probe") => probe_only(&args).await,
         _ => eprintln!("usage: read-ahead-bench run [--addr A] [--rtt-ms N] [--load-writers N] [--runs N] [--out F] [--sizes a,b] [--variants v,w] | summarize F | upload [same flags] | summarize-upload F | score [--detail] F... (variants take a `:<tuning>` suffix; tunings: {})", tuning::NAMES),
     }
 }
