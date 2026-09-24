@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `stat` answered during a download no longer waits for the rest of the download to arrive first.** On tokio's multi-thread runtime, the task a response wakes waits on the same worker thread as the connection's receiver task, and nothing else may run it. A receiver that kept finding the next frame ready (a loaded client, a fast link) went on routing READs back to back, so a side `stat` on a QNAP NAS ran 333 ms after its answer came in. The receiver now steps aside for one turn after each frame it routes, which costs about 40 ns a frame, so the woken caller runs first.
+
 ## [0.26.0] - 2026-09-24
 
 ### Breaking

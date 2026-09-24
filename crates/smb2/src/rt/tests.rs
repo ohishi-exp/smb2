@@ -103,6 +103,31 @@ async fn an_unbounded_timeout_does_not_overflow() {
     assert_eq!(timeout(Duration::MAX, async { 1 }).await, Ok(1));
 }
 
+/// A yield is exactly one turn: pending once, having woken itself so the
+/// executor comes back, then done. Executor-independent, so polled by hand.
+#[test]
+fn yield_now_steps_aside_once_and_wakes_itself() {
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Wake;
+
+    struct CountWakes(AtomicUsize);
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+    let waker = Arc::clone(&wakes).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut yielding = pin!(yield_now());
+
+    assert!(yielding.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(yielding.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(feature = "tokio")]
 mod on_tokio {
     use super::*;

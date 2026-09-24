@@ -182,6 +182,43 @@ where
     }
 }
 
+/// Give the executor one turn: the current task goes to the back of the
+/// queue, and whatever is ready runs first.
+///
+/// On tokio this is what lets a task we just woke run: tokio puts it in this
+/// worker's LIFO slot, which no other worker may steal, so it waits for us to
+/// yield.
+///
+/// A self-wake, the same on every executor (it's what smol's `yield_now` is).
+/// Tokio requeues a task that woke itself during its poll at the back of the
+/// local queue, behind the LIFO slot, so it does the job there too. ❌ Don't
+/// swap in `tokio::task::yield_now`: it defers the wake until the worker next
+/// polls the I/O driver, which measured 5–13 µs a call against ~40 ns here,
+/// and the receiver task pays it once per frame.
+pub(crate) fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
+
+/// The future [`yield_now`] returns.
+#[derive(Debug)]
+#[must_use = "a yield does nothing unless awaited"]
+pub(crate) struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
 /// A timer: resolves once its deadline has passed.
 ///
 /// `Unpin`, so it can be raced with `futures_util::future::select` after a

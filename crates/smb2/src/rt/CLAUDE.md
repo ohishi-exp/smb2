@@ -7,7 +7,7 @@ runtime" section.
 ## Files
 
 - `mod.rs`: `backend()`, `spawn` / `TaskHandle`, `sleep` / `sleep_until` / `Sleep`, `timeout` / `timeout_at` /
-  `Elapsed`, and `Instant`
+  `Elapsed`, `yield_now`, and `Instant`
 - `net.rs`: `resolve`, `TcpStream` (split into `ReadHalf` / `WriteHalf`), `UdpSocket` (the KDC client's)
 - `tests.rs`: each contract scenario is one async fn, run once under `#[tokio::test]` and once under `smol::block_on`
 - The end-to-end proof lives elsewhere: `client/smol_runtime_tests.rs` (real loopback sockets, no tokio runtime) and
@@ -48,6 +48,11 @@ created from the same context, so one connection never mixes the two.
 - **The test suite needs the `tokio` feature.** It is written against tokio's paused clock, so a smol-only build is
   compile-checked (lib and examples), not tested. The smol behavior is tested under `--features smol` (both on) by
   the files above, and against real Samba by `tests/smol_integration.rs` on a smol-only build.
+- **`yield_now` is a plain self-wake, with no backend switch.** It works on any executor (smol's own `yield_now` is
+  the same thing), and tokio requeues a task that woke itself at the back of the local queue, behind the LIFO slot,
+  which is the whole point: the receiver task yields once per routed frame so the caller it woke gets to run
+  (`client/CLAUDE.md` § Connection internals). ❌ Don't swap in `tokio::task::yield_now`: it defers the wake until the
+  worker next polls the I/O driver, measured at 5–13 µs a call against ~40 ns for the self-wake.
 - `Sleep` boxes tokio's timer so `Sleep` is `Unpin` and races with `futures_util::future::select` after a plain
   `pin!`. One allocation per timer is noise next to the frame each one guards.
 

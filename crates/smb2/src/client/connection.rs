@@ -5748,6 +5748,14 @@ async fn receiver_loop(
                 }
             }
         }
+
+        // Let a caller we just woke run before we read the next frame. On
+        // tokio it sits in this worker's LIFO slot, which nothing else may
+        // steal, and a socket that never drains never makes us yield on our
+        // own: a side `stat` once waited 333 ms behind the rest of a download
+        // that way. Released first, since we hold `inner` only per frame.
+        drop(inner);
+        rt::yield_now().await;
     }
 }
 
@@ -8024,6 +8032,57 @@ mod tests {
             conn.outstanding_requests()[0].async_id,
             Some(0xFEED_FACE_DEAD_BEEF),
             "and a consumer driving send_cancel itself has to be able to read it"
+        );
+    }
+
+    /// A caller the receiver task wakes runs before the receiver routes the
+    /// rest of a download. On a multi-thread tokio runtime the woken task lands
+    /// in the receiver's worker's LIFO slot, which no other worker may steal,
+    /// so it runs only once the receiver yields. A socket that never drains
+    /// (the mock always has the next frame ready, like a loaded client behind a
+    /// fast link) never makes the receiver yield on its own: a side `stat` on a
+    /// QNAP waited 333 ms after its answer was routed that way. Counted in
+    /// frames, not milliseconds, so a slow CI box can't make it flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_woken_caller_runs_before_the_receiver_routes_the_rest_of_a_download() {
+        const BIG_FRAMES: usize = 200;
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        let mut stat = conn.register_waiter(MessageId(1), Command::Echo).unwrap();
+        let counter = mock.clone();
+        let caller = tokio::spawn(async move {
+            stat.recv().await.expect("the ECHO is answered");
+            counter.received_count()
+        });
+        // Registered but never awaited, the way a download's later chunks sit
+        // routed and unclaimed: routing them wakes nobody.
+        let _download: Vec<WaiterGuard> = (0..BIG_FRAMES as u64)
+            .map(|i| {
+                conn.register_waiter(MessageId(2 + i), Command::Read)
+                    .unwrap()
+            })
+            .collect();
+        // Let the caller park on its answer before any frame arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut frames = vec![echo_response_granting(1, 1)];
+        for i in 0..BIG_FRAMES as u64 {
+            let mut read = crate::client::test_helpers::build_read_response(vec![0xAB; 64 * 1024]);
+            read[24..32].copy_from_slice(&(2 + i).to_le_bytes());
+            frames.push(read);
+        }
+        mock.queue_responses(frames);
+
+        let routed_when_caller_ran = caller.await.unwrap();
+        assert!(
+            routed_when_caller_ran <= 3,
+            "the caller ran only after the receiver had read {routed_when_caller_ran} of {} frames",
+            BIG_FRAMES + 1
         );
     }
 
