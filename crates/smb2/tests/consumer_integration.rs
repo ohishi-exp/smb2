@@ -190,7 +190,7 @@ async fn auth_connect_and_operate() {
     let test_path = "consumer_test_auth.tmp";
     let test_data = b"auth write test";
     client
-        .write_file(&mut tree, test_path, test_data)
+        .write_file(&tree, test_path, test_data)
         .await
         .expect("write_file");
 
@@ -203,7 +203,7 @@ async fn auth_connect_and_operate() {
 
     // Clean up.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file");
     client.disconnect_share(&tree).await.expect("disconnect");
@@ -440,10 +440,10 @@ async fn readonly_write_fails() {
     let _ = env_logger::try_init();
 
     let mut client = connect_guest(&readonly_addr()).await;
-    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let tree = client.connect_share("public").await.expect("connect_share");
 
     let err = client
-        .write_file(&mut tree, "should_fail.txt", b"nope")
+        .write_file(&tree, "should_fail.txt", b"nope")
         .await
         .expect_err("write should fail on readonly share");
 
@@ -584,7 +584,7 @@ async fn slow_operations_work() {
     let test_path = "consumer_test_slow.tmp";
     let test_data = b"slow write test data";
     client
-        .write_file(&mut tree, test_path, test_data)
+        .write_file(&tree, test_path, test_data)
         .await
         .expect("write_file on slow server");
     let readback = client
@@ -595,7 +595,7 @@ async fn slow_operations_work() {
 
     // Clean up.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file");
     client.disconnect_share(&tree).await.expect("disconnect");

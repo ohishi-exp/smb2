@@ -326,26 +326,6 @@ pub(crate) fn host_of(addr: &str) -> &str {
     }
 }
 
-/// Which tree a followed DFS link hands back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkTarget {
-    /// A tree connect of its own, because the caller's `&mut Tree` becomes it
-    /// and the caller may disconnect it.
-    Caller,
-    /// The one tree per target share that the pool keeps, for calls whose
-    /// caller never sees it (`Connections::link_tree`).
-    Shared,
-}
-
-/// Whether a `&mut Tree` convenience method runs again after reviving a dead
-/// session. Only for calls whose retry can't change what was asked for; see
-/// [`ClientConfig::auto_reconnect`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Replay {
-    AfterReconnect,
-    Never,
-}
-
 /// Where a rename of `from` to `to` lands on a DFS link's target, given that
 /// the referral turned `from` into `remaining` there.
 ///
@@ -401,9 +381,50 @@ async fn rename_on(
 /// What [`SmbClient::follow_dfs_link`] came back with.
 struct Followed<T> {
     result: Result<T>,
-    /// The link's target, when the call was redirected there, whether or not
-    /// the call then succeeded on it.
-    moved_to: Option<Tree>,
+    /// The link, when the call was redirected through one, whether or not
+    /// the call then succeeded on its target.
+    moved_to: Option<Link>,
+}
+
+/// A DFS link a call followed.
+struct Link {
+    /// The link's target share, pooled (`Connections::link_tree`).
+    tree: Tree,
+    /// How many leading components of the caller's path the link folder
+    /// takes up.
+    covers: usize,
+    /// How many leading components of a path on `tree` stand for that same
+    /// folder: nonzero when the link points at a folder inside its share.
+    target_prefix: usize,
+}
+
+impl Link {
+    fn new(tree: Tree, caller_path: &str, remaining: &str, link_depth: usize) -> Self {
+        let caller = components(caller_path).len();
+        let covers = link_depth.min(caller);
+        let target_prefix = components(remaining).len().saturating_sub(caller - covers);
+        Link {
+            tree,
+            covers,
+            target_prefix,
+        }
+    }
+
+    /// `target_path`, a path relative to the link's target share, in the
+    /// caller's terms: relative to the caller's own share, link folder first.
+    fn caller_path(&self, caller_path: &str, target_path: &str) -> String {
+        components(caller_path)
+            .into_iter()
+            .take(self.covers)
+            .chain(components(target_path).into_iter().skip(self.target_prefix))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// A caller path's components (`/` is the only separator a caller writes).
+fn components(path: &str) -> Vec<&str> {
+    path.split('/').filter(|c| !c.is_empty()).collect()
 }
 
 /// High-level SMB2 client with reconnection support.
@@ -968,7 +989,6 @@ impl SmbClient {
         &mut self,
         tree: &Tree,
         path: &str,
-        target: LinkTarget,
         op: &mut F,
     ) -> Followed<T>
     where
@@ -989,7 +1009,7 @@ impl SmbClient {
             }
         };
 
-        let (moved_to, remaining) = match self.redirect(tree, path, target).await {
+        let (moved_to, remaining) = match self.redirect(tree, path).await {
             Ok(redirected) => redirected,
             Err(e @ Error::DfsNoReachableTarget { .. }) => {
                 return Followed {
@@ -1007,8 +1027,8 @@ impl SmbClient {
                 };
             }
         };
-        let result = match self.connections.for_tree(&moved_to) {
-            Ok(conn) => op(conn.clone(), moved_to.clone(), remaining).await,
+        let result = match self.connections.for_tree(&moved_to.tree) {
+            Ok(conn) => op(conn.clone(), moved_to.tree.clone(), remaining).await,
             Err(e) => Err(e),
         };
         Followed {
@@ -1017,57 +1037,52 @@ impl SmbClient {
         }
     }
 
-    /// [`follow_dfs_link`](Self::follow_dfs_link) for the convenience methods
-    /// that take `&mut Tree`: a followed link moves the caller's tree onto the
-    /// target share, and `replay` says whether a dead session is revived and
-    /// the call run again (see [`ClientConfig::auto_reconnect`]).
-    async fn on_tree<T, F, Fut>(
-        &mut self,
-        tree: &mut Tree,
-        path: &str,
-        replay: Replay,
-        mut op: F,
-    ) -> Result<T>
-    where
-        F: FnMut(Connection, Tree, String) -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        let followed = self
-            .follow_dfs_link(tree, path, LinkTarget::Caller, &mut op)
-            .await;
-        if let Some(moved_to) = followed.moved_to {
-            *tree = moved_to;
-            return followed.result;
-        }
-        match followed.result {
-            Err(e) if replay == Replay::AfterReconnect && self.session_is_gone(tree, &e) => {
-                self.recover_tree(tree).await?;
-                let conn = self.connections.for_tree(tree)?.clone();
-                op(conn, tree.clone(), path.to_string()).await
-            }
-            other => other,
-        }
-    }
-
-    /// [`follow_dfs_link`](Self::follow_dfs_link) for the calls that leave the
-    /// caller's tree alone: the streaming and handle calls, whose handle keeps
-    /// the target tree for itself, and the batches, whose other items may not
-    /// sit behind the link at all. Hands back the target tree when the call
-    /// was redirected.
+    /// [`follow_dfs_link`](Self::follow_dfs_link) for every path-taking call.
+    /// Hands back the link's target tree when the call was redirected, for a
+    /// handle to keep; ❌ never for the caller's own tree, which stays on its
+    /// share so the next path on it means what the caller meant (see
+    /// `client/CLAUDE.md` § DFS).
     async fn beside_tree<T, F, Fut>(
         &mut self,
         tree: &Tree,
         path: &str,
         mut op: F,
-    ) -> Result<(T, Option<Tree>)>
+    ) -> Result<(T, Option<Link>)>
     where
         F: FnMut(Connection, Tree, String) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let followed = self
-            .follow_dfs_link(tree, path, LinkTarget::Shared, &mut op)
-            .await;
+        let followed = self.follow_dfs_link(tree, path, &mut op).await;
         Ok((followed.result?, followed.moved_to))
+    }
+
+    /// [`beside_tree`](Self::beside_tree) for the calls that also run again after
+    /// reviving a dead session: the reads, listings, and `stat`, whose retry
+    /// can't change what was asked for (see [`ClientConfig::auto_reconnect`]).
+    ///
+    /// The one reason a convenience method still takes `&mut Tree`: a revival
+    /// gives the share a new tree id on the new session, and `recover_tree`
+    /// writes it into the caller's tree. A call that went through a DFS link
+    /// isn't replayed, since its session was the target's, not the tree's.
+    async fn replaying<T, F, Fut>(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        mut op: F,
+    ) -> Result<(T, Option<Link>)>
+    where
+        F: FnMut(Connection, Tree, String) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let followed = self.follow_dfs_link(tree, path, &mut op).await;
+        match followed.result {
+            Err(e) if followed.moved_to.is_none() && self.session_is_gone(tree, &e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connections.for_tree(tree)?.clone();
+                Ok((op(conn, tree.clone(), path.to_string()).await?, None))
+            }
+            result => Ok((result?, followed.moved_to)),
+        }
     }
 
     /// Whether `err` is a server saying `path` sits behind a DFS link.
@@ -1089,15 +1104,11 @@ impl SmbClient {
     /// Resolve the DFS link covering `original_path` on `tree`, connecting the
     /// target server (pooling the connection) and share.
     ///
-    /// Returns the target tree and the path the referral leaves on it. Tries
+    /// Returns the link (its target tree, and how it maps paths) and the path
+    /// the referral leaves on the target. Tries
     /// each target in turn, and says [`Error::DfsNoReachableTarget`] when the
     /// referral named targets and none of them answered.
-    async fn redirect(
-        &mut self,
-        tree: &Tree,
-        original_path: &str,
-        target: LinkTarget,
-    ) -> Result<(Tree, String)> {
+    async fn redirect(&mut self, tree: &Tree, original_path: &str) -> Result<(Link, String)> {
         // The referral lookup and the tree-connect path have to name the same
         // server, so this goes through the one derivation (`host_of`).
         let hostname = host_of(&tree.server).to_string();
@@ -1118,17 +1129,17 @@ impl SmbClient {
         let mut last_error = None;
         for resolved in &resolved_list {
             let target_addr = self.target_addr(resolved);
-            match self
-                .link_target_tree(&target_addr, &resolved.share, target)
-                .await
-            {
+            match self.link_target_tree(&target_addr, &resolved.share).await {
                 Ok(new_tree) => {
                     // Remember which target worked, so a failover survives
                     // the next lookup instead of re-walking the dead one.
                     self.dfs_resolver.note_target_worked(resolved);
                     // Back into caller-path form: the retry goes through the
                     // ordinary `Tree` methods, which encode what they're given.
-                    return Ok((new_tree, crate::name::decode_path(&resolved.remaining_path)));
+                    let remaining = crate::name::decode_path(&resolved.remaining_path);
+                    let link =
+                        Link::new(new_tree, original_path, &remaining, resolved.link_depth());
+                    return Ok((link, remaining));
                 }
                 Err(e) => {
                     debug!(
@@ -1150,23 +1161,14 @@ impl SmbClient {
         }
     }
 
-    /// Connect a link's target share: a fresh tree connect for a caller that
-    /// will own the tree (and may disconnect it), the pooled one otherwise.
-    async fn link_target_tree(
-        &mut self,
-        target_addr: &str,
-        share: &str,
-        target: LinkTarget,
-    ) -> Result<Tree> {
-        if target == LinkTarget::Shared {
-            if let Some(tree) = self.connections.link_tree(target_addr, share) {
-                return Ok(tree);
-            }
+    /// A link's target share, connected once and pooled
+    /// (`Connections::link_tree`).
+    async fn link_target_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
+        if let Some(tree) = self.connections.link_tree(target_addr, share) {
+            return Ok(tree);
         }
         let tree = self.connect_target(target_addr, share).await?;
-        if target == LinkTarget::Shared {
-            self.connections.remember_link_tree(&tree);
-        }
+        self.connections.remember_link_tree(&tree);
         Ok(tree)
     }
 
@@ -1308,39 +1310,35 @@ impl SmbClient {
     // ── Convenience methods that delegate to Tree ──────────────────────
     //
     // Every path-taking method here follows a DFS link inside the share once,
-    // through `follow_dfs_link`. The `&mut Tree` ones move the caller's tree
-    // onto the link's target; the rest leave it where it is. See
-    // `client/CLAUDE.md` § DFS.
+    // through `follow_dfs_link`, and leaves the caller's tree on its share. The
+    // ones taking `&mut Tree` replay after a reconnect, which renews its tree
+    // id. See `client/CLAUDE.md` § DFS.
 
     /// List files in a directory on the given share.
     ///
     /// This is a convenience wrapper around [`Tree::list_directory`] that
     /// saves you from threading `connection_mut()` through every call.
-    /// If the server returns a DFS referral, the tree is updated in-place
-    /// and the operation is retried on the target server.
+    /// A path behind a DFS link is listed on the link's target; `tree` stays on
+    /// its own share either way.
     pub async fn list_directory(
         &mut self,
         tree: &mut Tree,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.list_directory(&mut conn, &path).await },
-        )
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.list_directory(&mut conn, &path).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Read a file from the given share.
     pub async fn read_file(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.read_file(&mut conn, &path).await },
-        )
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.read_file(&mut conn, &path).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Read a small file using a compound CREATE+READ+CLOSE request.
@@ -1349,35 +1347,29 @@ impl SmbClient {
     /// round-trips from 3 to 1. Best for files that fit in a single
     /// READ (up to MaxReadSize, typically 8 MB).
     pub async fn read_file_compound(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.read_file_compound(&mut conn, &path).await },
-        )
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.read_file_compound(&mut conn, &path).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Read a file using pipelined I/O (faster for large files).
     pub async fn read_file_pipelined(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.read_file_pipelined(&mut conn, &path).await },
-        )
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.read_file_pipelined(&mut conn, &path).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Write data to a file on the given share (create or overwrite).
-    pub async fn write_file(&mut self, tree: &mut Tree, path: &str, data: &[u8]) -> Result<u64> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move { tree.write_file(&mut conn, &path, data).await },
-        )
+    pub async fn write_file(&mut self, tree: &Tree, path: &str, data: &[u8]) -> Result<u64> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.write_file(&mut conn, &path, data).await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Write a small file using a compound CREATE+WRITE+FLUSH+CLOSE request.
@@ -1388,14 +1380,15 @@ impl SmbClient {
     /// [`write_file_pipelined`](Self::write_file_pipelined).
     pub async fn write_file_compound(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        self.on_tree(tree, path, Replay::Never, |mut conn, tree, path| async move {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
             tree.write_file_compound(&mut conn, &path, data).await
         })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Write a small NEW file in one compound CREATE+WRITE+FLUSH+CLOSE request.
@@ -1406,38 +1399,30 @@ impl SmbClient {
     /// untouched. See [`Tree::write_file_compound_exclusive`].
     pub async fn write_file_compound_exclusive(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move {
-                tree.write_file_compound_exclusive(&mut conn, &path, data)
-                    .await
-            },
-        )
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.write_file_compound_exclusive(&mut conn, &path, data)
+                .await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Write data to a file using pipelined I/O (faster for large files).
     pub async fn write_file_pipelined(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move {
-                tree.write_file_pipelined(&mut conn, &path, data).await
-            },
-        )
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.write_file_pipelined(&mut conn, &path, data).await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Query file system space information for the given share.
@@ -1446,24 +1431,20 @@ impl SmbClient {
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&mut self, tree: &mut Tree) -> Result<tree::FsInfo> {
         // No path: a referral here is for the share's root.
-        self.on_tree(
-            tree,
-            "",
-            Replay::AfterReconnect,
-            |mut conn, tree, _| async move { tree.fs_info(&mut conn).await },
-        )
+        self.replaying(tree, "", |mut conn, tree, _| async move {
+            tree.fs_info(&mut conn).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Delete a file on the given share.
-    pub async fn delete_file(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move { tree.delete_file(&mut conn, &path).await },
-        )
+    pub async fn delete_file(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.delete_file(&mut conn, &path).await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Delete multiple files on the given share.
@@ -1476,7 +1457,7 @@ impl SmbClient {
     ///
     /// Items behind a DFS link follow it, asking for the referral once per
     /// batch; `tree` stays on its own share, where the other items are.
-    pub async fn delete_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<()>> {
+    pub async fn delete_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<()>> {
         let mut results = Vec::with_capacity(paths.len());
         for path in paths {
             let result = self
@@ -1491,13 +1472,11 @@ impl SmbClient {
 
     /// Get file metadata (size, timestamps, whether it's a directory).
     pub async fn stat(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.stat(&mut conn, &path).await },
-        )
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.stat(&mut conn, &path).await
+        })
         .await
+        .map(|(value, _)| value)
     }
 
     /// Ask the server which file `path` names, and what it calls it: the
@@ -1505,18 +1484,20 @@ impl SmbClient {
     /// returns, and the file's identity. See [`Tree::resolve`].
     ///
     /// Follows a DFS link and replays after a reconnect, like
-    /// [`stat`](Self::stat). After a DFS redirect the returned path is
-    /// relative to the target share, which is what `tree` points at by then.
+    /// [`stat`](Self::stat). Behind a link, the returned path is still relative
+    /// to `tree`'s share, link folder included, so it opens the same file.
     #[doc(alias = "canonicalize")]
     #[doc(alias = "realpath")]
     pub async fn resolve(&mut self, tree: &mut Tree, path: &str) -> Result<resolve::Resolved> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::AfterReconnect,
-            |mut conn, tree, path| async move { tree.resolve(&mut conn, &path).await },
-        )
-        .await
+        let (mut resolved, link) = self
+            .replaying(tree, path, |mut conn, tree, path| async move {
+                tree.resolve(&mut conn, &path).await
+            })
+            .await?;
+        if let Some(link) = link {
+            resolved.path = link.caller_path(path, &resolved.path);
+        }
+        Ok(resolved)
     }
 
     /// Stat multiple files on the given share.
@@ -1530,7 +1511,7 @@ impl SmbClient {
     ///
     /// Items behind a DFS link follow it, asking for the referral once per
     /// batch; `tree` stays on its own share, where the other items are.
-    pub async fn stat_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
+    pub async fn stat_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
         let mut results = Vec::with_capacity(paths.len());
         for path in paths {
             let result = self
@@ -1548,12 +1529,13 @@ impl SmbClient {
     /// Behind a DFS link, a rename within one directory follows the link;
     /// any other keeps the server's `STATUS_PATH_NOT_COVERED`, since its
     /// destination may not be behind the same link.
-    pub async fn rename(&mut self, tree: &mut Tree, from: &str, to: &str) -> Result<()> {
+    pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
         let caller = (tree.tree_id, tree.server.clone());
-        self.on_tree(tree, from, Replay::Never, |conn, target, path| {
+        self.beside_tree(tree, from, |conn, target, path| {
             rename_on(conn, target, path, caller.clone(), from, to)
         })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Rename multiple files on the given share.
@@ -1567,11 +1549,7 @@ impl SmbClient {
     /// Items behind a DFS link follow it like [`rename`](Self::rename), asking
     /// for the referral once per batch; `tree` stays on its own share, where
     /// the other items are.
-    pub async fn rename_files(
-        &mut self,
-        tree: &mut Tree,
-        renames: &[(&str, &str)],
-    ) -> Vec<Result<()>> {
+    pub async fn rename_files(&mut self, tree: &Tree, renames: &[(&str, &str)]) -> Vec<Result<()>> {
         let mut results = Vec::with_capacity(renames.len());
         let caller = (tree.tree_id, tree.server.clone());
         for (from, to) in renames {
@@ -1586,25 +1564,21 @@ impl SmbClient {
     }
 
     /// Create a directory on the given share.
-    pub async fn create_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move { tree.create_directory(&mut conn, &path).await },
-        )
+    pub async fn create_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.create_directory(&mut conn, &path).await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Delete an empty directory on the given share.
-    pub async fn delete_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
-        self.on_tree(
-            tree,
-            path,
-            Replay::Never,
-            |mut conn, tree, path| async move { tree.delete_directory(&mut conn, &path).await },
-        )
+    pub async fn delete_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.delete_directory(&mut conn, &path).await
+        })
         .await
+        .map(|(done, _)| done)
     }
 
     /// Start a streaming file download (memory-efficient for large files).
@@ -1648,7 +1622,7 @@ impl SmbClient {
                 tree.open_file(&mut conn, &path).await
             })
             .await?;
-        let tree = moved_to.map_or(Cow::Borrowed(tree), Cow::Owned);
+        let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
         let conn = self.connections.for_tree(&tree)?;
         Ok(FileDownload::of_open_file(tree, conn, file_id, file_size))
     }
@@ -1709,7 +1683,7 @@ impl SmbClient {
                 }
             })
             .await?;
-        let tree = moved_to.map_or(Cow::Borrowed(tree), Cow::Owned);
+        let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
         let conn = self.connections.for_tree(&tree)?;
         Ok(match opened {
             None => stream::FileUpload::new_done(tree, conn, data.len() as u64),
@@ -1832,7 +1806,7 @@ impl SmbClient {
     /// progress twice.
     pub async fn read_file_with_progress<F>(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         on_progress: F,
     ) -> Result<Vec<u8>>
@@ -1841,14 +1815,12 @@ impl SmbClient {
     {
         // Only the open goes through the link helper, so no progress is
         // reported before the file is open wherever it lives.
-        let (file_id, file_size) = self
-            .on_tree(
-                tree,
-                path,
-                Replay::Never,
-                |mut conn, tree, path| async move { tree.open_file(&mut conn, &path).await },
-            )
+        let ((file_id, file_size), moved_to) = self
+            .beside_tree(tree, path, |mut conn, tree, path| async move {
+                tree.open_file(&mut conn, &path).await
+            })
             .await?;
+        let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
         let conn = self.connections.for_tree(tree)?;
         tree.read_open_file_with_progress(conn, path, file_id, file_size, on_progress)
             .await
@@ -1867,7 +1839,7 @@ impl SmbClient {
     /// progress twice.
     pub async fn write_file_with_progress<F>(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         data: &[u8],
         mut on_progress: F,
@@ -1876,8 +1848,8 @@ impl SmbClient {
         F: FnMut(Progress) -> ControlFlow<()>,
     {
         // Open the file for writing.
-        let file_id = self
-            .on_tree(tree, path, Replay::Never, |conn, tree, path| async move {
+        let (file_id, moved_to) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
                 let req = crate::msg::create::CreateRequest {
                     requested_oplock_level: crate::types::OplockLevel::None,
                     impersonation_level: crate::msg::create::ImpersonationLevel::Impersonation,
@@ -1909,6 +1881,8 @@ impl SmbClient {
                 Ok(crate::msg::create::CreateResponse::unpack(&mut cursor)?.file_id)
             })
             .await?;
+        // The rest runs where the file was opened: the link's target, if any.
+        let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
         let conn = self.connections.for_tree(tree)?;
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1991,7 +1965,7 @@ impl SmbClient {
     /// a chunk.
     pub async fn write_file_streamed<F>(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         path: &str,
         next_chunk: &mut F,
     ) -> Result<u64>
@@ -2000,11 +1974,13 @@ impl SmbClient {
     {
         // Only the open goes through the link helper, so no chunk is pulled
         // before the file is open wherever it lives.
-        let file_id = self
-            .on_tree(tree, path, Replay::Never, |mut conn, tree, path| async move {
+        let (file_id, moved_to) = self
+            .beside_tree(tree, path, |mut conn, tree, path| async move {
                 tree.open_file_for_write(&mut conn, &path).await
             })
             .await?;
+        // The rest runs where the file was opened: the link's target, if any.
+        let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
         let conn = self.connections.for_tree(tree)?;
         tree.write_open_file_streamed(conn, file_id, next_chunk)
             .await
@@ -2017,7 +1993,7 @@ impl SmbClient {
     /// `write_file_with_progress`) flush automatically before closing.
     /// Use this if you need to flush a handle obtained through the
     /// low-level API.
-    pub async fn flush_file(&mut self, tree: &mut Tree, file_id: FileId) -> Result<()> {
+    pub async fn flush_file(&mut self, tree: &Tree, file_id: FileId) -> Result<()> {
         let conn = self.connections.for_tree(tree)?;
         tree.flush_handle(conn, file_id).await
     }
@@ -2735,9 +2711,9 @@ mod tests {
         // plain.txt: an ordinary file in the root share.
         mock.queue_response(deleted());
 
-        let mut tree = a_dfs_root_tree();
+        let tree = a_dfs_root_tree();
         let results = client
-            .delete_files(&mut tree, &["data/a", "data/b", "plain.txt"])
+            .delete_files(&tree, &["data/a", "data/b", "plain.txt"])
             .await;
 
         assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
@@ -2761,6 +2737,69 @@ mod tests {
         );
         assert_eq!(tree.tree_id, TreeId(1), "the caller's tree stays put");
         mock.assert_fully_consumed();
+    }
+
+    /// A single-file call through a link leaves the caller's tree on its own
+    /// share, so the next path on it still means what the caller meant. When
+    /// the tree moved, `plain.txt` went to the link's target share: a
+    /// `NOT_FOUND`, or a same-named file there read or deleted.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_through_a_link_leaves_the_callers_tree_on_its_share() {
+        use crate::client::test_helpers::*;
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        // data/a: refused, referral, target share, deleted there.
+        mock.queue_response(path_not_covered(3));
+        queue_link_referral(&mock);
+        mock.queue_response(deleted());
+        // plain.txt, read from the root share: CREATE + READ + CLOSE.
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FileId::SENTINEL, 5),
+            build_read_response(b"plain".to_vec()),
+            build_close_response(),
+        ]));
+
+        let mut tree = a_dfs_root_tree();
+        client
+            .delete_file(&tree, "data/a")
+            .await
+            .expect("delete through the link");
+        let plain = client
+            .read_file(&mut tree, "plain.txt")
+            .await
+            .expect("read from the root share");
+
+        assert_eq!(plain, b"plain");
+        assert_eq!(
+            creates_on(&mock),
+            [Some(TreeId(1)), Some(LINK_TARGET_TREE), Some(TreeId(1))]
+        );
+        assert_eq!((tree.tree_id, tree.share_name.as_str()), (TreeId(1), "dfs"));
+        mock.assert_fully_consumed();
+    }
+
+    /// A path the link's target hands back reads in the caller's terms: the
+    /// caller's link folder, then the target path past the target's own
+    /// folder, so it opens the same file on the caller's tree.
+    #[test]
+    fn a_target_path_maps_back_through_the_link() {
+        let link = |covers, target_prefix| Link {
+            tree: a_dfs_root_tree(),
+            covers,
+            target_prefix,
+        };
+        // `data` -> `\\fs02\files`: data/HELLO.TXT is hello.txt there.
+        assert_eq!(
+            link(1, 0).caller_path("data/HELLO.TXT", "hello.txt"),
+            "data/hello.txt"
+        );
+        // `a/data` -> `\\fs02\files\sub`: a/data/x/f is sub/x/f there.
+        assert_eq!(
+            link(2, 1).caller_path("a/data/X/f", "sub/x/f"),
+            "a/data/x/f"
+        );
+        // The link folder itself.
+        assert_eq!(link(1, 0).caller_path("data", ""), "data");
     }
 
     /// A rename's destination is share-relative, so behind a link it has to
@@ -3284,8 +3323,7 @@ mod tests {
         ));
 
         // The batch methods report per item, so they say it per item.
-        let mut orphan = orphan;
-        let results = client.stat_files(&mut orphan, &["a.txt", "b.txt"]).await;
+        let results = client.stat_files(&orphan, &["a.txt", "b.txt"]).await;
         assert_eq!(results.len(), 2);
         assert!(results
             .iter()
@@ -3704,15 +3742,15 @@ mod tests {
             contents: Vec::new(),
             dialed: std::sync::atomic::AtomicUsize::new(0),
         });
-        let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
+        let (mut client, tree) = client_on_a_dead_session(reviver.clone()).await;
 
         for (what, outcome) in [
-            ("delete", client.delete_file(&mut tree, "x.txt").await.err()),
-            ("rename", client.rename(&mut tree, "a", "b").await.err()),
-            ("mkdir", client.create_directory(&mut tree, "d").await.err()),
+            ("delete", client.delete_file(&tree, "x.txt").await.err()),
+            ("rename", client.rename(&tree, "a", "b").await.err()),
+            ("mkdir", client.create_directory(&tree, "d").await.err()),
             (
                 "write",
-                client.write_file(&mut tree, "x.txt", b"data").await.err(),
+                client.write_file(&tree, "x.txt", b"data").await.err(),
             ),
         ] {
             assert!(

@@ -254,6 +254,14 @@ pub(crate) struct ResolvedPath {
     target_index: usize,
 }
 
+impl ResolvedPath {
+    /// How many components of a path inside the share the referral covered:
+    /// the link folder's depth, for example 1 for `\\server\share\data`.
+    pub(crate) fn link_depth(&self) -> usize {
+        path_components(&self.cache_key).len().saturating_sub(2)
+    }
+}
+
 /// A single DFS target from a referral response.
 #[derive(Debug, Clone)]
 struct DfsTarget {

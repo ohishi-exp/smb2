@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The server doesn't implement server-side copy; do it the slow way.
             eprintln!("Server has no server-side copy; falling back to read+write.");
             let data = client.read_file(&mut share, &src).await?;
-            client.write_file_pipelined(&mut share, &dst, &data).await?;
+            client.write_file_pipelined(&share, &dst, &data).await?;
             println!(
                 "Copied {} bytes {src} -> {dst} client-side in {:.2?}",
                 data.len(),

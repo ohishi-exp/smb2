@@ -767,7 +767,7 @@ async fn streaming_download_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let mut tree = client
+    let tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
@@ -777,7 +777,7 @@ async fn streaming_download_large_file() {
     let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&mut tree, test_path, &test_data)
+        .write_file(&tree, test_path, &test_data)
         .await
         .expect("write_file failed");
     println!("Setup: wrote {} bytes", test_data.len());
@@ -831,7 +831,7 @@ async fn streaming_download_large_file() {
 
     // Clean up.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -857,7 +857,7 @@ async fn write_with_progress_and_cancel() {
 
     let mut progress_updates = Vec::new();
     let written = client
-        .write_file_with_progress(&mut tree, test_path, &test_data, |progress| {
+        .write_file_with_progress(&tree, test_path, &test_data, |progress| {
             println!(
                 "  progress: {}/{} ({:.1}%)",
                 progress.bytes_transferred,
@@ -888,7 +888,7 @@ async fn write_with_progress_and_cancel() {
 
     // Clean up the first file.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
 
@@ -896,7 +896,7 @@ async fn write_with_progress_and_cancel() {
     let cancel_path = "smb2_test_write_cancel.tmp";
     let half = test_data.len() as u64 / 2;
     let result = client
-        .write_file_with_progress(&mut tree, cancel_path, &test_data, |progress| {
+        .write_file_with_progress(&tree, cancel_path, &test_data, |progress| {
             if progress.bytes_transferred >= half {
                 println!("  cancelling at {:.1}%", progress.percent());
                 ControlFlow::Break(())
@@ -913,7 +913,7 @@ async fn write_with_progress_and_cancel() {
     }
 
     // The partially written file may or may not exist. Try to clean up.
-    let _ = client.delete_file(&mut tree, cancel_path).await;
+    let _ = client.delete_file(&tree, cancel_path).await;
 
     client
         .disconnect_share(&tree)
@@ -997,7 +997,7 @@ async fn debug_rapid_pipelined_writes() {
     };
 
     let mut client = SmbClient::connect(config).await.expect("connect failed");
-    let mut share = client.connect_share("naspi").await.expect("tree failed");
+    let share = client.connect_share("naspi").await.expect("tree failed");
 
     eprintln!("Connected. Credits: {}", client.credits());
 
@@ -1009,7 +1009,7 @@ async fn debug_rapid_pipelined_writes() {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            client.write_file_pipelined(&mut share, &path, &data),
+            client.write_file_pipelined(&share, &path, &data),
         )
         .await;
 
@@ -1035,7 +1035,7 @@ async fn debug_rapid_pipelined_writes() {
     // Cleanup
     for i in 0..20 {
         let path = format!("_test/smb2_diag_{}.tmp", i);
-        let _ = client.delete_file(&mut share, &path).await;
+        let _ = client.delete_file(&share, &path).await;
     }
     let _ = client.disconnect_share(&share).await;
 }
@@ -1061,9 +1061,7 @@ async fn micro_benchmark_smb2_vs_native() {
     let mut client = SmbClient::connect(config).await.expect("connect");
     let mut share = client.connect_share("naspi").await.expect("tree");
 
-    let _ = client
-        .create_directory(&mut share, "_test/smb2_bench")
-        .await;
+    let _ = client.create_directory(&share, "_test/smb2_bench").await;
 
     let file_count = 50;
     let file_size = 100 * 1024; // 100 KB
@@ -1074,7 +1072,7 @@ async fn micro_benchmark_smb2_vs_native() {
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
         client
-            .write_file_pipelined(&mut share, &path, &data)
+            .write_file_pipelined(&share, &path, &data)
             .await
             .expect("write");
     }
@@ -1120,7 +1118,7 @@ async fn micro_benchmark_smb2_vs_native() {
     let start = std::time::Instant::now();
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
-        client.delete_file(&mut share, &path).await.expect("delete");
+        client.delete_file(&share, &path).await.expect("delete");
     }
     let smb2_delete = start.elapsed();
 
@@ -1171,9 +1169,7 @@ async fn micro_benchmark_smb2_vs_native() {
     };
 
     // Cleanup
-    let _ = client
-        .delete_directory(&mut share, "_test/smb2_bench")
-        .await;
+    let _ = client.delete_directory(&share, "_test/smb2_bench").await;
     let _ = client.disconnect_share(&share).await;
 
     // Results
@@ -1328,7 +1324,7 @@ async fn streaming_upload_large_file() {
 
     // Clean up.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1388,7 +1384,7 @@ async fn streaming_upload_small_file_uses_compound() {
 
     // Clean up.
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1467,7 +1463,7 @@ async fn streaming_upload_and_download_on_pi() {
     println!("Roundtrip verified: {} bytes match", received.len());
 
     // Clean up (best-effort).
-    let _ = client.delete_file(&mut tree, test_path).await;
+    let _ = client.delete_file(&tree, test_path).await;
     let _ = client.disconnect_share(&tree).await;
 }
 
@@ -1583,7 +1579,7 @@ async fn watch_directory_on_nas() {
     local
         .run_until(async {
             let mut watcher_client = connect_client_to_nas().await;
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("naspi")
                 .await
                 .expect("tree connect failed (watcher)");
@@ -1595,10 +1591,10 @@ async fn watch_directory_on_nas() {
             // got another test's `removed: smb2-illegal-names`. A watch test
             // has to own its watch scope or it is testing the scheduler.
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test")
+                .create_directory(&watcher_share, "_test")
                 .await;
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test/watch_probe")
+                .create_directory(&watcher_share, "_test/watch_probe")
                 .await;
 
             // Start watching it (non-recursive).
@@ -1624,7 +1620,7 @@ async fn watch_directory_on_nas() {
             let writer_stop = std::rc::Rc::clone(&stop);
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("naspi")
                     .await
                     .expect("tree connect failed (writer)");
@@ -1636,7 +1632,7 @@ async fn watch_directory_on_nas() {
                     }
                     let path = format!("_test/watch_probe/smb2_watch_test_{i}.tmp");
                     writer_client
-                        .write_file(&mut writer_share, &path, b"watch test")
+                        .write_file(&writer_share, &path, b"watch test")
                         .await
                         .expect("write_file failed");
                     created.push(path);
@@ -1673,10 +1669,10 @@ async fn watch_directory_on_nas() {
             watcher.close().await.expect("watcher close failed");
 
             // Wait for the writer task and clean up everything it made.
-            let (mut writer_client, mut writer_share, created) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share, created) = writer_task.await.unwrap();
             for path in &created {
                 writer_client
-                    .delete_file(&mut writer_share, path)
+                    .delete_file(&writer_share, path)
                     .await
                     .expect("delete_file failed");
             }
@@ -1712,7 +1708,7 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
             watcher_client
                 .connection_mut()
                 .set_long_poll_refresh(Some(Duration::from_secs(3)));
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("naspi")
                 .await
                 .expect("tree connect failed (watcher)");
@@ -1720,16 +1716,16 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
             // creates and deletes files there, and a sibling test's event would
             // end this watch before a single refresh had happened.
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test")
+                .create_directory(&watcher_share, "_test")
                 .await;
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test/refresh_probe")
+                .create_directory(&watcher_share, "_test/refresh_probe")
                 .await;
             let test_file_path = "_test/refresh_probe/smb2_refresh_test.tmp";
             // A leftover would survive a panicking run and make the write a
             // "modified" rather than an "added".
             let _ = watcher_client
-                .delete_file(&mut watcher_share, test_file_path)
+                .delete_file(&watcher_share, test_file_path)
                 .await;
 
             let mut watcher = watcher_client
@@ -1738,7 +1734,7 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
                 .expect("watch failed");
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("naspi")
                     .await
                     .expect("tree connect failed (writer)");
@@ -1746,7 +1742,7 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
                 // before anything happens in the directory.
                 tokio::time::sleep(Duration::from_secs(11)).await;
                 writer_client
-                    .write_file(&mut writer_share, test_file_path, b"refresh test")
+                    .write_file(&writer_share, test_file_path, b"refresh test")
                     .await
                     .expect("write_file failed");
                 (writer_client, writer_share)
@@ -1785,9 +1781,9 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
             );
 
             watcher.close().await.expect("watcher close failed");
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&mut writer_share, test_file_path)
+                .delete_file(&writer_share, test_file_path)
                 .await
                 .expect("delete_file failed");
             let _ = writer_client.disconnect_share(&writer_share).await;
@@ -1824,7 +1820,7 @@ async fn nas_accepts_stacked_change_notify() {
     local
         .run_until(async {
             let mut watcher_client = connect_client_to_nas().await;
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("naspi")
                 .await
                 .expect("tree connect (watcher)");
@@ -1832,14 +1828,14 @@ async fn nas_accepts_stacked_change_notify() {
             // Clean from any prior run.
             for i in 0..N_CYCLES {
                 let _ = watcher_client
-                    .delete_file(&mut watcher_share, &format!("{DIR}/file_{i:02}.tmp"))
+                    .delete_file(&watcher_share, &format!("{DIR}/file_{i:02}.tmp"))
                     .await;
             }
             let _ = watcher_client
-                .delete_directory(&mut watcher_share, DIR)
+                .delete_directory(&watcher_share, DIR)
                 .await;
             watcher_client
-                .create_directory(&mut watcher_share, DIR)
+                .create_directory(&watcher_share, DIR)
                 .await
                 .expect("create test dir");
 
@@ -1854,14 +1850,14 @@ async fn nas_accepts_stacked_change_notify() {
             // window behavior.
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("naspi")
                     .await
                     .expect("tree connect (writer)");
                 for i in 0..N_CYCLES {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     writer_client
-                        .write_file(&mut writer_share, &format!("{DIR}/file_{i:02}.tmp"), b"x")
+                        .write_file(&writer_share, &format!("{DIR}/file_{i:02}.tmp"), b"x")
                         .await
                         .unwrap_or_else(|e| panic!("write file_{i:02}.tmp: {e}"));
                 }
@@ -1913,13 +1909,13 @@ async fn nas_accepts_stacked_change_notify() {
 
             // Cleanup.
             watcher.close().await.expect("watcher close");
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
             for i in 0..N_CYCLES {
                 let _ = writer_client
-                    .delete_file(&mut writer_share, &format!("{DIR}/file_{i:02}.tmp"))
+                    .delete_file(&writer_share, &format!("{DIR}/file_{i:02}.tmp"))
                     .await;
             }
-            let _ = writer_client.delete_directory(&mut writer_share, DIR).await;
+            let _ = writer_client.delete_directory(&writer_share, DIR).await;
             let _ = writer_client.disconnect_share(&writer_share).await;
 
             assert_eq!(
@@ -2254,7 +2250,7 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
             .connect_share("naspi")
             .await
             .expect("connect_share setup");
-        let _ = client.create_directory(&mut share, BENCH_DIR).await;
+        let _ = client.create_directory(&share, BENCH_DIR).await;
 
         let data = vec![0x42u8; FILE_SIZE];
         let setup_start = std::time::Instant::now();
@@ -2269,7 +2265,7 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
             };
             if !already_there {
                 client
-                    .write_file(&mut share, &path, &data)
+                    .write_file(&share, &path, &data)
                     .await
                     .expect("upload");
                 uploaded += 1;
@@ -2526,13 +2522,13 @@ async fn nas_stores_an_illegal_name_the_way_macos_does() {
 
     for name in names {
         client
-            .delete_file(&mut tree, &format!("{dir}/{name}"))
+            .delete_file(&tree, &format!("{dir}/{name}"))
             .await
             .ok();
     }
-    client.delete_directory(&mut tree, dir).await.ok();
+    client.delete_directory(&tree, dir).await.ok();
     client
-        .create_directory(&mut tree, dir)
+        .create_directory(&tree, dir)
         .await
         .expect("create the test directory");
 
@@ -2540,7 +2536,7 @@ async fn nas_stores_an_illegal_name_the_way_macos_does() {
         let path = format!("{dir}/{name}");
         let payload = format!("content for {name}").into_bytes();
         client
-            .write_file(&mut tree, &path, &payload)
+            .write_file(&tree, &path, &payload)
             .await
             .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
         let read_back = client
@@ -2561,12 +2557,12 @@ async fn nas_stores_an_illegal_name_the_way_macos_does() {
 
     for name in names {
         client
-            .delete_file(&mut tree, &format!("{dir}/{name}"))
+            .delete_file(&tree, &format!("{dir}/{name}"))
             .await
             .unwrap_or_else(|e| panic!("delete {name:?}: {e}"));
     }
     client
-        .delete_directory(&mut tree, dir)
+        .delete_directory(&tree, dir)
         .await
         .expect("cleanup the test directory");
 }

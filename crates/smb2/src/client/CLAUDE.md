@@ -225,13 +225,19 @@ an Interlink by re-resolving and stopping at `MAX_DFS_HOPS`.
 
 **A link, at every `SmbClient` call that takes a path.** A CREATE refused with `STATUS_PATH_NOT_COVERED` sends
 `follow_dfs_link` to resolve the referral, connect the target, and run the call once more there with the remaining path.
-It's the one place that happens; every entry point goes through it, via one of two wrappers:
+It's the one place that happens; every entry point goes through it, via `beside_tree` (or `replaying`, the same
+plus a replay after reviving a dead session, for the reads, listings, `stat`, and `resolve`).
 
-- **`on_tree`**, for the `&mut Tree` convenience methods: the caller's tree moves onto the target (a fresh tree connect
-  of its own, since the caller may disconnect it), so later paths on it are target-relative.
-- **`beside_tree`**, for everything that leaves the tree alone: `download`, `upload`, `watch`, the four handle openers,
-  and the batches. The handle keeps the target tree, the caller's stays on its share. These share one tree connect per
-  target share (`Connections::link_tree`, stamped with the connection's generation, dropped by `disconnect_share` and on
+- ❌ **The caller's tree never moves.** A path on it always means the caller's share, link folder included, so browsing
+  into a link and back out on one tree works. Rewriting it to the target (which these calls once did) made every later
+  path target-relative: a `NOT_FOUND` on a folder that exists, or a same-named file on the target read, overwritten, or
+  deleted. `a_call_through_a_link_leaves_the_callers_tree_on_its_share` and the Docker
+  `dfs_listing_a_link_then_the_root_lists_the_root` pin it.
+- **What comes back is in the caller's terms too.** A handle keeps the target tree for itself (`FileDownload`,
+  `FileWriter`, `Watcher`); a path the target returns (`Resolved::path`) goes back through `Link::caller_path`, which
+  swaps the target's folder for the caller's link folder using the referral's depth (`ResolvedPath::link_depth`).
+- **One tree connect per target share** (`Connections::link_tree`, stamped with the connection's generation, dropped by
+  `disconnect_share` and on reconnect) (`Connections::link_tree`, stamped with the connection's generation, dropped by `disconnect_share` and on
   reconnect). ❌ Don't tree-connect per call here: a handle can't disconnect its tree, so every copy out of a link would
   leak one.
 - **Once only.** A target answering `STATUS_PATH_NOT_COVERED` in turn is the caller's answer.
@@ -241,9 +247,8 @@ It's the one place that happens; every entry point goes through it, via one of t
 - ❌ **The op gets owned clones** (`Connection`, `Tree`, `String`). An `AsyncFnMut` over borrowed arguments reads better
   and compiles, but rustc can't prove its future `Send` (higher-ranked lifetimes), and consumers spawn these calls.
   `dfs_following_futures_stay_send` fails if it regresses.
-- **Batches follow item by item**, on the caller's tree: the first linked item pays the referral, the rest hit the cache,
-  and items outside the link stay on the share. Moving the batch onto the target would send the other items'
-  share-relative paths to the wrong share, which for `delete_files` means deleting a same-named file there.
+- **Batches follow item by item** like every other call: the first linked item pays the referral, the rest hit the cache,
+  and items outside the link run on the caller's share.
 - **A rename carries its destination along** only within one directory (`link_rename_target`): SET_INFO's destination is
   share-relative, and anything else may leave the link. Otherwise it keeps `STATUS_PATH_NOT_COVERED`.
 - **`Pipeline` doesn't follow links**: it reports `STATUS_PATH_NOT_COVERED` per op, since a hidden referral would break
@@ -298,7 +303,9 @@ It's the one place that happens; every entry point goes through it, via one of t
   argument.
 - **Referral targets dial port 445**: UNC paths carry no port, and 445 is universal in production. Tests remap them with
   `ClientConfig::dfs_target_overrides`.
-- Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
+- Only the methods that replay after a reconnect (`list_directory`, `read_file*`, `fs_info`, `stat`, `resolve`) take
+  `&mut Tree`: `recover_tree` writes the share's new tree id into it. Every other method takes `&Tree`, so its signature
+  says it can't touch the tree
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
 - Streaming methods (`download`, `upload`) keep `&Tree`: `FileDownload` / `FileUpload` hold a `Cow<'a, Tree>`, borrowed
   from the caller or owning the link's target, so the public shape didn't change
@@ -543,7 +550,6 @@ Decisions behind this shape (cited by ID from code, like decision E3), and what 
 - **FileDownload/FileUpload can leak handles on drop**: Rust has no async drop. An upload not consumed fully, or a download dropped before its last chunk arrives, leaks the file handle. The types log a warning. (A download sends its CLOSE as the last chunk lands, so dropping it after that is safe.)
 - **FileWriter can leak handles on drop**: Same as FileDownload/FileUpload. Rust has no async drop. If not consumed via `finish()` or `abort()`, the file handle leaks. The type logs a debug warning.
 - **DFS paths must include server\share prefix**: When `SMB2_FLAGS_DFS_OPERATIONS` is set, the server expects the path to start with `server\share\` (MS-SMB2 3.2.4.3). `Tree::format_path()` handles this automatically for DFS shares. Without the prefix, Samba strips the first two path components, leading to wrong file opens.
-- **DFS redirect changes the tree in-place**: After a DFS redirect, `tree.server`, `tree.share_name`, and `tree.tree_id` all change. Subsequent operations on the same tree use the target server directly -- they must use target-relative paths, not the original DFS paths.
 - **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `Connections::for_tree` can distinguish servers that share the same hostname but use different ports.
 - **Every write that creates a file comes in a replacing and an exclusive form**: `write_file_compound` / `create_file_writer` use `FileOverwriteIf` (create or replace); `write_file_compound_exclusive` / `create_file_writer_exclusive` use `FileCreate`, which the server refuses atomically with `STATUS_OBJECT_NAME_COLLISION` (`ErrorKind::AlreadyExists`, an `Error::Protocol` naming the CREATE) if the name exists. A consumer that checked a name was free and then writes must use the exclusive form: the replacing one silently overwrites a file another writer put there in between. The disposition stays private (`*_with_disposition`), so the public surface is exactly these pairs.
 - **Servers MAY split compound responses**: MS-SMB2 section 3.3.4.1.3 says the server SHOULD compound responses but is not required to. Samba (and QNAP firmware built on it) is known to split compound chains into separate frames in some scenarios; Windows Server does too under certain conditions. The receiver task routes each sub-response by its `MessageId`, so `execute_compound` reassembles a split chain in submission order and no caller sees the difference (§ Receiving compound responses). Nothing counts or logs a split.

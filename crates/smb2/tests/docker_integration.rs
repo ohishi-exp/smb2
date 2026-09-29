@@ -720,7 +720,7 @@ async fn auth_connect_and_operate() {
     let test_data = b"authenticated write test";
 
     client
-        .write_file(&mut tree, test_path, test_data)
+        .write_file(&tree, test_path, test_data)
         .await
         .expect("write_file failed");
 
@@ -731,7 +731,7 @@ async fn auth_connect_and_operate() {
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
 
@@ -771,7 +771,7 @@ async fn guest_streaming_download() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let mut tree = client
+    let tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -780,7 +780,7 @@ async fn guest_streaming_download() {
     let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&mut tree, test_path, &test_data)
+        .write_file(&tree, test_path, &test_data)
         .await
         .expect("write_file failed");
 
@@ -807,7 +807,7 @@ async fn guest_streaming_download() {
     drop(download);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -835,12 +835,12 @@ async fn guest_tree_download_streams_via_connection() {
     // via the low-level Tree::download API.
     {
         let mut client = guest_client().await;
-        let mut write_tree = client
+        let write_tree = client
             .connect_share("public")
             .await
             .expect("connect_share failed");
         client
-            .write_file(&mut write_tree, test_path, &test_data)
+            .write_file(&write_tree, test_path, &test_data)
             .await
             .expect("write_file failed");
         client
@@ -869,12 +869,12 @@ async fn guest_tree_download_streams_via_connection() {
     // download; reuse it for the delete to exercise the same connection
     // end-to-end).
     let mut client = guest_client().await;
-    let mut cleanup_tree = client
+    let cleanup_tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
     client
-        .delete_file(&mut cleanup_tree, test_path)
+        .delete_file(&cleanup_tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -925,7 +925,7 @@ async fn guest_streaming_upload() {
     assert_eq!(readback, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -952,7 +952,7 @@ async fn guest_write_with_progress() {
 
     let mut progress_updates = Vec::new();
     let written = client
-        .write_file_with_progress(&mut tree, test_path, &test_data, |progress| {
+        .write_file_with_progress(&tree, test_path, &test_data, |progress| {
             progress_updates.push(progress.bytes_transferred);
             ControlFlow::Continue(())
         })
@@ -969,7 +969,7 @@ async fn guest_write_with_progress() {
     assert_eq!(readback, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -984,7 +984,7 @@ async fn guest_write_cancel_midway() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let mut tree = client
+    let tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -994,7 +994,7 @@ async fn guest_write_cancel_midway() {
     let half = test_data.len() as u64 / 2;
 
     let result = client
-        .write_file_with_progress(&mut tree, cancel_path, &test_data, |progress| {
+        .write_file_with_progress(&tree, cancel_path, &test_data, |progress| {
             if progress.bytes_transferred >= half {
                 ControlFlow::Break(())
             } else {
@@ -1009,7 +1009,7 @@ async fn guest_write_cancel_midway() {
     }
 
     // Best-effort cleanup.
-    let _ = client.delete_file(&mut tree, cancel_path).await;
+    let _ = client.delete_file(&tree, cancel_path).await;
     client
         .disconnect_share(&tree)
         .await
@@ -1071,7 +1071,7 @@ async fn guest_a_writer_paces_and_leaves_an_upload_rate() {
     assert_eq!(readback, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1159,14 +1159,14 @@ async fn guest_watch_directory() {
     local
         .run_until(async {
             let mut watcher_client = guest_client().await;
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("public")
                 .await
                 .expect("tree connect failed (watcher)");
 
             // Ensure a subdirectory to watch exists.
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test_watch")
+                .create_directory(&watcher_share, "_test_watch")
                 .await;
 
             let mut watcher = watcher_client
@@ -1178,7 +1178,7 @@ async fn guest_watch_directory() {
             let test_file_path = "_test_watch/docker_watch_test.tmp";
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = guest_client().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("public")
                     .await
                     .expect("tree connect failed (writer)");
@@ -1186,7 +1186,7 @@ async fn guest_watch_directory() {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
                 writer_client
-                    .write_file(&mut writer_share, test_file_path, b"watch test")
+                    .write_file(&writer_share, test_file_path, b"watch test")
                     .await
                     .expect("write_file failed");
 
@@ -1205,15 +1205,15 @@ async fn guest_watch_directory() {
             watcher.close().await.expect("watcher close failed");
 
             // Cleanup.
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&mut writer_share, test_file_path)
+                .delete_file(&writer_share, test_file_path)
                 .await
                 .expect("delete_file failed");
             let _ = writer_client.disconnect_share(&writer_share).await;
 
             let _ = watcher_client
-                .delete_directory(&mut watcher_share, "_test_watch")
+                .delete_directory(&watcher_share, "_test_watch")
                 .await;
         })
         .await;
@@ -1240,7 +1240,7 @@ async fn guest_watch_survives_repeated_refreshes() {
             watcher_client
                 .connection_mut()
                 .set_long_poll_refresh(Some(Duration::from_secs(2)));
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("public")
                 .await
                 .expect("tree connect failed (watcher)");
@@ -1248,11 +1248,11 @@ async fn guest_watch_survives_repeated_refreshes() {
             // Its own directory: a sibling test writing into a shared one would
             // end this watch before a single refresh had happened.
             let _ = watcher_client
-                .create_directory(&mut watcher_share, "_test_refresh")
+                .create_directory(&watcher_share, "_test_refresh")
                 .await;
             let test_file_path = "_test_refresh/docker_refresh_test.tmp";
             let _ = watcher_client
-                .delete_file(&mut watcher_share, test_file_path)
+                .delete_file(&watcher_share, test_file_path)
                 .await;
 
             let mut watcher = watcher_client
@@ -1262,14 +1262,14 @@ async fn guest_watch_survives_repeated_refreshes() {
 
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = guest_client().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("public")
                     .await
                     .expect("tree connect failed (writer)");
                 // Long enough for several cycles to have come and gone first.
                 tokio::time::sleep(Duration::from_secs(7)).await;
                 writer_client
-                    .write_file(&mut writer_share, test_file_path, b"refresh test")
+                    .write_file(&writer_share, test_file_path, b"refresh test")
                     .await
                     .expect("write_file failed");
                 (writer_client, writer_share)
@@ -1301,14 +1301,14 @@ async fn guest_watch_survives_repeated_refreshes() {
             );
 
             watcher.close().await.expect("watcher close failed");
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&mut writer_share, test_file_path)
+                .delete_file(&writer_share, test_file_path)
                 .await
                 .expect("delete_file failed");
             let _ = writer_client.disconnect_share(&writer_share).await;
             let _ = watcher_client
-                .delete_directory(&mut watcher_share, "_test_refresh")
+                .delete_directory(&watcher_share, "_test_refresh")
                 .await;
         })
         .await;
@@ -1359,7 +1359,7 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
             // Watcher and writer each on their own SmbClient. Today's
             // API forces this: `Watcher` borrows `&mut Connection`.
             let mut watcher_client = guest_client().await;
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("public")
                 .await
                 .expect("tree connect failed (watcher)");
@@ -1368,17 +1368,14 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
             // because delete_directory only works on empty dirs.
             for i in 0..N {
                 let _ = watcher_client
-                    .delete_file(
-                        &mut watcher_share,
-                        &format!("_test_watch_loss/file_{i:03}.txt"),
-                    )
+                    .delete_file(&watcher_share, &format!("_test_watch_loss/file_{i:03}.txt"))
                     .await;
             }
             let _ = watcher_client
-                .delete_directory(&mut watcher_share, "_test_watch_loss")
+                .delete_directory(&watcher_share, "_test_watch_loss")
                 .await;
             watcher_client
-                .create_directory(&mut watcher_share, "_test_watch_loss")
+                .create_directory(&watcher_share, "_test_watch_loss")
                 .await
                 .expect("create _test_watch_loss");
 
@@ -1397,7 +1394,7 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
                     let writers_done = writers_done.clone();
                     tokio::task::spawn_local(async move {
                         let mut writer_client = guest_client().await;
-                        let mut writer_share = writer_client
+                        let writer_share = writer_client
                             .connect_share("public")
                             .await
                             .expect("tree connect failed (writer)");
@@ -1415,7 +1412,7 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
                         for i in start..end {
                             let path = format!("_test_watch_loss/file_{i:03}.txt");
                             writer_client
-                                .write_file(&mut writer_share, &path, b"x")
+                                .write_file(&writer_share, &path, b"x")
                                 .await
                                 .unwrap_or_else(|e| panic!("write_file {path}: {e}"));
                         }
@@ -1472,17 +1469,14 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
                 let (c, s) = h.await.unwrap();
                 cleanup_client_share = Some((c, s));
             }
-            if let Some((mut cleanup_client, mut cleanup_share)) = cleanup_client_share {
+            if let Some((mut cleanup_client, cleanup_share)) = cleanup_client_share {
                 for i in 0..N {
                     let _ = cleanup_client
-                        .delete_file(
-                            &mut cleanup_share,
-                            &format!("_test_watch_loss/file_{i:03}.txt"),
-                        )
+                        .delete_file(&cleanup_share, &format!("_test_watch_loss/file_{i:03}.txt"))
                         .await;
                 }
                 let _ = cleanup_client
-                    .delete_directory(&mut cleanup_share, "_test_watch_loss")
+                    .delete_directory(&cleanup_share, "_test_watch_loss")
                     .await;
                 let _ = cleanup_client.disconnect_share(&cleanup_share).await;
             }
@@ -1803,7 +1797,7 @@ async fn encryption_required_connect_and_operate() {
     let test_data = b"encrypted write test data 1234567890";
 
     client
-        .write_file(&mut tree, test_path, test_data)
+        .write_file(&tree, test_path, test_data)
         .await
         .expect("write_file failed (encrypted)");
 
@@ -1814,7 +1808,7 @@ async fn encryption_required_connect_and_operate() {
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1838,7 +1832,7 @@ async fn encryption_required_pipelined_large_file() {
     let test_data: Vec<u8> = (0..524_288).map(|i| (i % 199) as u8).collect();
 
     client
-        .write_file_pipelined(&mut tree, test_path, &test_data)
+        .write_file_pipelined(&tree, test_path, &test_data)
         .await
         .expect("write_file_pipelined failed (encrypted)");
 
@@ -1849,7 +1843,7 @@ async fn encryption_required_pipelined_large_file() {
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1910,7 +1904,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
     let test_data = b"AES-128-CCM encrypted write test";
 
     client
-        .write_file(&mut tree, test_path, test_data)
+        .write_file(&tree, test_path, test_data)
         .await
         .expect("write_file failed (AES-128-CCM)");
 
@@ -1921,7 +1915,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -2348,7 +2342,7 @@ async fn maxread_streaming_download() {
     .await
     .expect("connect failed");
 
-    let mut tree = client
+    let tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -2357,7 +2351,7 @@ async fn maxread_streaming_download() {
     let test_data: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&mut tree, test_path, &test_data)
+        .write_file(&tree, test_path, &test_data)
         .await
         .expect("write_file failed");
 
@@ -2384,7 +2378,7 @@ async fn maxread_streaming_download() {
 
     drop(download);
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -2484,14 +2478,14 @@ async fn dfs_resolve_is_relative_to_the_share_the_caller_holds() {
         .expect("resolve on the DFS root share failed");
     assert_eq!(resolved.path, "Root-File.txt");
 
-    // Through a link: the tree follows the redirect, and the path is
-    // relative to the target share it points at afterwards.
+    // Through a link: the tree stays on the root share, and the path comes
+    // back relative to it, link folder included, so it opens the same file.
     let through_link = client
         .resolve(&mut tree, "data/HELLO.TXT")
         .await
         .expect("resolve through the DFS link failed");
-    assert_eq!(through_link.path, "hello.txt");
-    assert_eq!(tree.share_name, "files");
+    assert_eq!(through_link.path, "data/hello.txt");
+    assert_eq!(tree.share_name, "dfs");
 
     client
         .disconnect_share(&tree)
@@ -2534,6 +2528,40 @@ async fn dfs_list_directory_through_link() {
         .expect("disconnect failed");
 }
 
+/// Browsing into a link and back out on the same tree: the tree stays on the
+/// root share, so the root listing is the root's, not the target's.
+#[tokio::test]
+#[ignore]
+async fn dfs_listing_a_link_then_the_root_lists_the_root() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+
+    let linked = client
+        .list_directory(&mut tree, "data")
+        .await
+        .expect("list_directory through the link");
+    assert!(
+        linked.iter().any(|e| e.name == "hello.txt"),
+        "expected the target's hello.txt, got {linked:?}"
+    );
+
+    let root = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory of the root share");
+    let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"Root-File.txt") && names.contains(&"data"),
+        "expected the root share's own entries, got {names:?}"
+    );
+    assert_eq!(tree.share_name, "dfs");
+}
+
 #[tokio::test]
 #[ignore]
 async fn dfs_write_and_read_roundtrip() {
@@ -2545,13 +2573,13 @@ async fn dfs_write_and_read_roundtrip() {
     // Write through DFS link using a fresh client.
     {
         let mut client = dfs_client().await;
-        let mut tree = client
+        let tree = client
             .connect_share("dfs")
             .await
             .expect("connect_share('dfs') failed");
 
         client
-            .write_file(&mut tree, test_path, test_data)
+            .write_file(&tree, test_path, test_data)
             .await
             .expect("write_file through DFS link failed");
 
@@ -2575,11 +2603,9 @@ async fn dfs_write_and_read_roundtrip() {
             .expect("read_file through DFS link failed");
         assert_eq!(data, test_data);
 
-        // Clean up: after the DFS redirect, the tree now points to the
-        // target share directly. Use the target-relative path (without
-        // the "data/" DFS link prefix) for cleanup.
+        // Clean up through the link: the tree stayed on the root share.
         client
-            .delete_file(&mut tree, "docker_dfs_roundtrip.tmp")
+            .delete_file(&tree, test_path)
             .await
             .expect("delete_file on target failed");
 
@@ -2653,7 +2679,7 @@ async fn dfs_link_file_writer_and_reader_reach_the_target() {
     let _ = env_logger::try_init();
 
     let mut client = dfs_client().await;
-    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let tree = client.connect_share("dfs").await.expect("connect_share");
     let path = "data/_dfs_link_writer.tmp";
 
     let mut writer = client
@@ -2674,7 +2700,7 @@ async fn dfs_link_file_writer_and_reader_reach_the_target() {
     reader.close().await.expect("reader close");
     assert_eq!(back, b"written through the link");
 
-    let results = client.delete_files(&mut tree, &[path]).await;
+    let results = client.delete_files(&tree, &[path]).await;
     assert!(results.iter().all(|r| r.is_ok()), "cleanup: {results:?}");
     assert_eq!(tree.share_name, "dfs");
 }
@@ -2685,7 +2711,7 @@ async fn dfs_link_batches_follow_the_link_item_by_item() {
     let _ = env_logger::try_init();
 
     let mut client = dfs_client().await;
-    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let tree = client.connect_share("dfs").await.expect("connect_share");
     let (a, b) = ("data/_dfs_link_batch_a.tmp", "data/_dfs_link_batch_b.tmp");
     for path in [a, b] {
         let mut writer = client
@@ -2697,7 +2723,7 @@ async fn dfs_link_batches_follow_the_link_item_by_item() {
     }
 
     // Two items behind the link and one in the root share, in one batch.
-    let stats = client.stat_files(&mut tree, &[a, "Root-File.txt", b]).await;
+    let stats = client.stat_files(&tree, &[a, "Root-File.txt", b]).await;
     let sizes: Vec<u64> = stats
         .into_iter()
         .map(|s| s.expect("stat_files item").size)
@@ -2705,13 +2731,13 @@ async fn dfs_link_batches_follow_the_link_item_by_item() {
     assert_eq!(sizes, [5, 5, 5]);
 
     let renamed = "data/_dfs_link_batch_renamed.tmp";
-    let results = client.rename_files(&mut tree, &[(a, renamed)]).await;
+    let results = client.rename_files(&tree, &[(a, renamed)]).await;
     assert!(
         results.iter().all(|r| r.is_ok()),
         "rename_files: {results:?}"
     );
 
-    let results = client.delete_files(&mut tree, &[renamed, b]).await;
+    let results = client.delete_files(&tree, &[renamed, b]).await;
     assert!(
         results.iter().all(|r| r.is_ok()),
         "delete_files: {results:?}"
@@ -2721,7 +2747,7 @@ async fn dfs_link_batches_follow_the_link_item_by_item() {
         "a batch leaves the caller's tree put"
     );
 
-    let gone = client.stat_files(&mut tree, &[renamed, b]).await;
+    let gone = client.stat_files(&tree, &[renamed, b]).await;
     assert!(
         gone.iter().all(|r| r
             .as_ref()
@@ -2736,12 +2762,12 @@ async fn dfs_link_watch_sees_changes_on_the_target() {
     let _ = env_logger::try_init();
 
     let mut client = dfs_client().await;
-    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let tree = client.connect_share("dfs").await.expect("connect_share");
     // Its own directory, so the other DFS tests writing into `data` stay quiet.
     // `create_directory` moves the tree it's given, so it gets a copy.
     let dir = "data/_dfs_link_watch";
-    let mut on_target = tree.clone();
-    let _ = client.create_directory(&mut on_target, dir).await;
+    let on_target = tree.clone();
+    let _ = client.create_directory(&on_target, dir).await;
 
     let mut watcher = client
         .watch(&tree, dir, false)
@@ -2770,10 +2796,10 @@ async fn dfs_link_watch_sees_changes_on_the_target() {
     );
     watcher.close().await.expect("watcher close");
 
-    let results = client.delete_files(&mut tree, &[watched]).await;
+    let results = client.delete_files(&tree, &[watched]).await;
     assert!(results.iter().all(|r| r.is_ok()), "cleanup: {results:?}");
     client
-        .delete_directory(&mut on_target, "_dfs_link_watch")
+        .delete_directory(&tree, dir)
         .await
         .expect("delete_directory");
 }
@@ -2809,7 +2835,7 @@ async fn guest_streamed_write() {
     };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, total_size as u64);
@@ -2822,7 +2848,7 @@ async fn guest_streamed_write() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -2856,7 +2882,7 @@ async fn guest_streamed_write_small_file() {
     };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, 100);
@@ -2868,7 +2894,7 @@ async fn guest_streamed_write_small_file() {
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -2907,7 +2933,7 @@ async fn guest_streamed_write_large() {
 
     let start = std::time::Instant::now();
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     let elapsed = start.elapsed();
@@ -2928,7 +2954,7 @@ async fn guest_streamed_write_large() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -2953,7 +2979,7 @@ async fn guest_streamed_write_empty() {
     let mut next_chunk = || -> Option<Result<Vec<u8>, std::io::Error>> { None };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, 0);
@@ -2966,7 +2992,7 @@ async fn guest_streamed_write_empty() {
     assert!(data.is_empty(), "expected empty file");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3108,7 +3134,7 @@ async fn encryption_streamed_write() {
     };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed (encryption)");
     assert_eq!(written, total_size as u64);
@@ -3121,7 +3147,7 @@ async fn encryption_streamed_write() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3199,7 +3225,7 @@ async fn guest_streamed_write_early_stop() {
     };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, (chunk_size * chunks_to_send) as u64);
@@ -3213,7 +3239,7 @@ async fn guest_streamed_write_early_stop() {
     assert_eq!(data, expected_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3256,7 +3282,7 @@ async fn guest_streamed_write_stress_100mb() {
 
     let start = std::time::Instant::now();
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     let write_elapsed = start.elapsed();
@@ -3281,7 +3307,7 @@ async fn guest_streamed_write_stress_100mb() {
     );
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3319,7 +3345,7 @@ async fn guest_streamed_write_rapid_sequential_50_files() {
         };
 
         let written = client
-            .write_file_streamed(&mut tree, &test_path, &mut next_chunk)
+            .write_file_streamed(&tree, &test_path, &mut next_chunk)
             .await
             .unwrap_or_else(|e| panic!("write_file_streamed failed on file {}: {}", i, e));
         assert_eq!(written, file_size as u64, "wrong byte count for file {}", i);
@@ -3341,7 +3367,7 @@ async fn guest_streamed_write_rapid_sequential_50_files() {
     for i in 0..file_count {
         let test_path = format!("smb2_test_rapid_seq_{:03}.tmp", i);
         client
-            .delete_file(&mut tree, &test_path)
+            .delete_file(&tree, &test_path)
             .await
             .unwrap_or_else(|e| panic!("delete_file failed on file {}: {}", i, e));
     }
@@ -3380,7 +3406,7 @@ async fn guest_streamed_write_large_single_chunk() {
     };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, total_size as u64);
@@ -3396,7 +3422,7 @@ async fn guest_streamed_write_large_single_chunk() {
     );
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3444,7 +3470,7 @@ async fn guest_streamed_write_alternating_sizes() {
         move || -> Option<Result<Vec<u8>, std::io::Error>> { chunk_iter.next().map(Ok) };
 
     let written = client
-        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .write_file_streamed(&tree, test_path, &mut next_chunk)
         .await
         .expect("write_file_streamed failed");
     assert_eq!(written, expected_data.len() as u64);
@@ -3460,7 +3486,7 @@ async fn guest_streamed_write_alternating_sizes() {
     );
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3516,7 +3542,7 @@ async fn guest_file_writer_basic() {
     assert_eq!(data, expected, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3587,7 +3613,7 @@ async fn guest_create_file_writer_exclusive_fails_on_existing() {
 
     let test_path = "smb2_test_file_writer_exclusive.bin";
     // Best-effort cleanup from a previous failed run.
-    let _ = client.delete_file(&mut tree, test_path).await;
+    let _ = client.delete_file(&tree, test_path).await;
 
     // 1. First creation succeeds and writes "original" bytes.
     let original = b"original payload";
@@ -3622,7 +3648,7 @@ async fn guest_create_file_writer_exclusive_fails_on_existing() {
     );
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3673,7 +3699,7 @@ async fn guest_file_writer_large() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3710,7 +3736,7 @@ async fn guest_file_writer_empty_file() {
     assert!(data.is_empty(), "expected empty file");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3752,7 +3778,7 @@ async fn guest_file_writer_single_byte() {
     assert_eq!(data, vec![0x42]);
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3809,7 +3835,7 @@ async fn guest_file_writer_overwrite() {
     assert_eq!(data, small_data, "content mismatch after overwrite");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3834,7 +3860,7 @@ async fn guest_file_writer_equivalence_with_pipelined() {
     // Write via write_file_pipelined.
     let pipelined_path = "smb2_test_fw_equiv_pipelined.bin";
     client
-        .write_file_pipelined(&mut tree, pipelined_path, &test_data)
+        .write_file_pipelined(&tree, pipelined_path, &test_data)
         .await
         .expect("write_file_pipelined failed");
 
@@ -3868,11 +3894,11 @@ async fn guest_file_writer_equivalence_with_pipelined() {
     );
 
     client
-        .delete_file(&mut tree, pipelined_path)
+        .delete_file(&tree, pipelined_path)
         .await
         .expect("delete pipelined file failed");
     client
-        .delete_file(&mut tree, writer_path)
+        .delete_file(&tree, writer_path)
         .await
         .expect("delete writer file failed");
     client
@@ -3928,7 +3954,7 @@ async fn guest_file_writer_binary_data() {
     assert_eq!(data, test_data, "binary data mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -3986,7 +4012,7 @@ async fn maxread_file_writer() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -4041,7 +4067,7 @@ async fn signing_file_writer() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -4083,7 +4109,7 @@ async fn encryption_file_writer() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -4178,7 +4204,7 @@ async fn guest_file_writer_stress_100mb() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -4243,7 +4269,7 @@ async fn slow_file_writer_stress_100mb() {
     assert_eq!(data, test_data, "content mismatch");
 
     client
-        .delete_file(&mut tree, test_path)
+        .delete_file(&tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -4810,14 +4836,14 @@ async fn a_reconnect_to_a_signing_required_server_re_derives_working_keys() {
     .expect("connect to smb-signing");
     assert!(client.params().unwrap().signing_required);
 
-    let mut tree = client
+    let tree = client
         .connect_share("private")
         .await
         .expect("connect_share");
     let path = "reconnect_signed.tmp";
     let payload = b"signed on both sides of the blip";
     client
-        .write_file(&mut tree, path, payload)
+        .write_file(&tree, path, payload)
         .await
         .expect("write before the reconnect");
 
@@ -4832,7 +4858,7 @@ async fn a_reconnect_to_a_signing_required_server_re_derives_working_keys() {
                  succeeding IS the proof that the keys were re-derived",
     );
     assert_eq!(read_back, payload);
-    client.delete_file(&mut tree, path).await.ok();
+    client.delete_file(&tree, path).await.ok();
 }
 
 /// The same round trip against the SMB 3.1.1 encryption-capable server.
@@ -4869,7 +4895,7 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
     .await
     .expect("connect to smb-encryption");
 
-    let mut tree = client
+    let tree = client
         .connect_share("private")
         .await
         .expect("connect_share");
@@ -4877,7 +4903,7 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
     let path = "reconnect_encrypted.tmp";
     let payload = b"the same posture on both sides of the blip";
     client
-        .write_file(&mut tree, path, payload)
+        .write_file(&tree, path, payload)
         .await
         .expect("write before the reconnect");
 
@@ -4902,7 +4928,7 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
         "a revival must re-establish the same crypto posture the session had, \
          not quietly drop or add encryption"
     );
-    client.delete_file(&mut tree, path).await.ok();
+    client.delete_file(&tree, path).await.ok();
 }
 
 // ── Names SMB2 refuses to carry (smb-weirdnames) ─────────────────────
@@ -5181,7 +5207,7 @@ async fn weirdnames_a_written_file_survives_a_full_round_trip() {
         let payload = format!("payload for {name}").into_bytes();
 
         client
-            .write_file(&mut tree, &path, &payload)
+            .write_file(&tree, &path, &payload)
             .await
             .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
 
@@ -5207,7 +5233,7 @@ async fn weirdnames_a_written_file_survives_a_full_round_trip() {
     // request shape (SET_INFO carries the target as its own buffer).
     let renamed = "scratch/w-renamed?to.this ";
     client
-        .rename(&mut tree, "scratch/w-q?mark", renamed)
+        .rename(&tree, "scratch/w-q?mark", renamed)
         .await
         .expect("rename to a name that needs mapping");
     assert!(client.stat(&mut tree, renamed).await.is_ok());
@@ -5227,7 +5253,7 @@ async fn weirdnames_a_written_file_survives_a_full_round_trip() {
             format!("scratch/{name}")
         };
         client
-            .delete_file(&mut tree, &path)
+            .delete_file(&tree, &path)
             .await
             .unwrap_or_else(|e| panic!("delete {path:?}: {e}"));
     }
@@ -5245,15 +5271,15 @@ async fn weirdnames_a_directory_whose_name_needs_mapping_can_be_created() {
 
     let dir = "scratch/made?by*smb2 ";
     let file = "scratch/made?by*smb2 /in|side.txt";
-    client.delete_file(&mut tree, file).await.ok();
-    client.delete_directory(&mut tree, dir).await.ok();
+    client.delete_file(&tree, file).await.ok();
+    client.delete_directory(&tree, dir).await.ok();
 
     client
-        .create_directory(&mut tree, dir)
+        .create_directory(&tree, dir)
         .await
         .expect("create a directory whose name needs mapping");
     client
-        .write_file(&mut tree, file, b"inside")
+        .write_file(&tree, file, b"inside")
         .await
         .expect("write into it");
 
@@ -5264,12 +5290,9 @@ async fn weirdnames_a_directory_whose_name_needs_mapping_can_be_created() {
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"in|side.txt"), "got {names:?}");
 
+    client.delete_file(&tree, file).await.expect("cleanup file");
     client
-        .delete_file(&mut tree, file)
-        .await
-        .expect("cleanup file");
-    client
-        .delete_directory(&mut tree, dir)
+        .delete_directory(&tree, dir)
         .await
         .expect("cleanup dir");
 }
@@ -5350,20 +5373,17 @@ async fn weirdnames_a_watch_reports_a_changed_name_the_way_a_listing_does() {
             let path = format!("{dir}/{name}");
 
             let mut watcher_client = weirdnames_client().await;
-            let mut watcher_share = watcher_client
+            let watcher_share = watcher_client
                 .connect_share("public")
                 .await
                 .expect("connect_share (watcher)");
+            watcher_client.delete_file(&watcher_share, &path).await.ok();
             watcher_client
-                .delete_file(&mut watcher_share, &path)
+                .delete_directory(&watcher_share, dir)
                 .await
                 .ok();
             watcher_client
-                .delete_directory(&mut watcher_share, dir)
-                .await
-                .ok();
-            watcher_client
-                .create_directory(&mut watcher_share, dir)
+                .create_directory(&watcher_share, dir)
                 .await
                 .expect("create the watch directory");
 
@@ -5375,13 +5395,13 @@ async fn weirdnames_a_watch_reports_a_changed_name_the_way_a_listing_does() {
             let write_path = path.clone();
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = weirdnames_client().await;
-                let mut writer_share = writer_client
+                let writer_share = writer_client
                     .connect_share("public")
                     .await
                     .expect("connect_share (writer)");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 writer_client
-                    .write_file(&mut writer_share, &write_path, b"hello")
+                    .write_file(&writer_share, &write_path, b"hello")
                     .await
                     .expect("write the watched file");
                 (writer_client, writer_share)
@@ -5398,13 +5418,13 @@ async fn weirdnames_a_watch_reports_a_changed_name_the_way_a_listing_does() {
             );
             watcher.close().await.expect("watcher close");
 
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&mut writer_share, &path)
+                .delete_file(&writer_share, &path)
                 .await
                 .expect("cleanup file");
             writer_client
-                .delete_directory(&mut writer_share, dir)
+                .delete_directory(&writer_share, dir)
                 .await
                 .expect("cleanup dir");
         })
@@ -5730,7 +5750,7 @@ async fn dfs_namespace_root_streams_writes_and_watches_on_the_target() {
     }
 
     let dir = "_test_dfs_namespace_streams";
-    let _ = client.create_directory(&mut tree, dir).await;
+    let _ = client.create_directory(&tree, dir).await;
 
     let written = format!("{dir}/written.tmp");
     let mut writer = client
@@ -5757,7 +5777,7 @@ async fn dfs_namespace_root_streams_writes_and_watches_on_the_target() {
         tokio::time::timeout(Duration::from_secs(10), watcher.next_events()),
         async {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            client.write_file(&mut tree, &watched, b"watch me").await
+            client.write_file(&tree, &watched, b"watch me").await
         }
     );
     write.expect("write_file into the watched directory");
@@ -5773,13 +5793,10 @@ async fn dfs_namespace_root_streams_writes_and_watches_on_the_target() {
     watcher.close().await.expect("watcher close");
 
     for path in [&written, &watched] {
-        client
-            .delete_file(&mut tree, path)
-            .await
-            .expect("delete_file");
+        client.delete_file(&tree, path).await.expect("delete_file");
     }
     client
-        .delete_directory(&mut tree, dir)
+        .delete_directory(&tree, dir)
         .await
         .expect("delete_directory");
 }

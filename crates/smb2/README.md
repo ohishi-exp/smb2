@@ -128,7 +128,7 @@ async fn main() -> Result<(), smb2::Error> {
 
     // Write a file
     let content = std::fs::read("local_file.txt")?;
-    client.write_file(&mut share, "remote_file.txt", &content).await?;
+    client.write_file(&share, "remote_file.txt", &content).await?;
 
     // Clean up
     client.disconnect_share(&share).await?;
@@ -345,15 +345,15 @@ For when you want to do one thing and get the result:
 - `client.connect_share()`: Connect to a share
 - `client.list_directory(&mut share, path)`: List a directory
 - `client.read_file(&mut share, path)`: Download a file
-- `client.write_file(&mut share, path, data)`: Upload a file
-- `client.delete_file(&mut share, path)`: Delete a file
-- `client.delete_files(&mut share, &paths)`: Delete many files, one result each
+- `client.write_file(&share, path, data)`: Upload a file
+- `client.delete_file(&share, path)`: Delete a file
+- `client.delete_files(&share, &paths)`: Delete many files, one result each
 - `client.stat(&mut share, path)`: Get file metadata
-- `client.stat_files(&mut share, &paths)`: Batch stat
-- `client.rename(&mut share, from, to)`: Rename a file
+- `client.stat_files(&share, &paths)`: Batch stat
+- `client.rename(&share, from, to)`: Rename a file
 - `client.rename_files(&mut share, &renames)`: Batch rename
-- `client.create_directory(&mut share, path)`: Create a directory
-- `client.delete_directory(&mut share, path)`: Remove a directory
+- `client.create_directory(&share, path)`: Create a directory
+- `client.delete_directory(&share, path)`: Remove a directory
 - `client.download(&share, path)`: Streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)

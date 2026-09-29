@@ -87,7 +87,7 @@ async fn write_read_delete(client: &mut SmbClient, share: &str, path: &str) {
     let data = format!("written from smol to {share}").into_bytes();
 
     client
-        .write_file(&mut tree, path, &data)
+        .write_file(&tree, path, &data)
         .await
         .expect("write_file failed");
     let read = client
@@ -97,7 +97,7 @@ async fn write_read_delete(client: &mut SmbClient, share: &str, path: &str) {
     assert_eq!(read, data);
 
     client
-        .delete_file(&mut tree, path)
+        .delete_file(&tree, path)
         .await
         .expect("delete_file failed");
     client
@@ -160,7 +160,7 @@ fn smol_mandatory_encryption_round_trips_a_file() {
 fn smol_streams_a_download_and_an_upload() {
     on_smol(async {
         let mut client = guest_client().await;
-        let mut tree = client
+        let tree = client
             .connect_share("public")
             .await
             .expect("connect_share failed");
@@ -187,7 +187,7 @@ fn smol_streams_a_download_and_an_upload() {
         assert_eq!(received, data);
 
         client
-            .delete_file(&mut tree, path)
+            .delete_file(&tree, path)
             .await
             .expect("delete_file failed");
         client
@@ -207,20 +207,18 @@ fn smol_watcher_sees_a_file_another_connection_writes() {
         let file = "_smol_watch/smol_watch.tmp";
 
         let mut watcher_client = guest_client().await;
-        let mut watcher_share = watcher_client
+        let watcher_share = watcher_client
             .connect_share("public")
             .await
             .expect("connect_share failed (watcher)");
-        let _ = watcher_client
-            .create_directory(&mut watcher_share, dir)
-            .await;
+        let _ = watcher_client.create_directory(&watcher_share, dir).await;
         let mut watcher = watcher_client
             .watch(&watcher_share, "_smol_watch/", false)
             .await
             .expect("watch failed");
 
         let mut writer_client = guest_client().await;
-        let mut writer_share = writer_client
+        let writer_share = writer_client
             .connect_share("public")
             .await
             .expect("connect_share failed (writer)");
@@ -228,7 +226,7 @@ fn smol_watcher_sees_a_file_another_connection_writes() {
         let write = async {
             smol::Timer::after(Duration::from_millis(500)).await;
             writer_client
-                .write_file(&mut writer_share, file, b"watch me")
+                .write_file(&writer_share, file, b"watch me")
                 .await
                 .expect("write_file failed");
         };
@@ -250,12 +248,10 @@ fn smol_watcher_sees_a_file_another_connection_writes() {
         watcher.close().await.expect("watcher close failed");
 
         writer_client
-            .delete_file(&mut writer_share, file)
+            .delete_file(&writer_share, file)
             .await
             .expect("delete_file failed");
         let _ = writer_client.disconnect_share(&writer_share).await;
-        let _ = watcher_client
-            .delete_directory(&mut watcher_share, dir)
-            .await;
+        let _ = watcher_client.delete_directory(&watcher_share, dir).await;
     });
 }
