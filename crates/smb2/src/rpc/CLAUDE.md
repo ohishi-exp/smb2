@@ -44,6 +44,7 @@ A `NetShareEnum` reply can be split two different ways, and the client handles b
 
 ## Gotchas
 
+- **BIND proposes plain NDR (`8A885D04-...`, v2) only, never NDR64.** Samba rejects an NDR64 proposal with `ProposedTransferSyntaxesNotSupported`, which is why share listing through smb-rs failed against Docker Samba. Every server speaks plain NDR.
 - **Pipe name is `srvsvc`**: The server prepends `\pipe\` automatically. Don't include it in the CREATE request.
 - **Admin shares filtered out**: `list_shares` filters shares ending with `$` (IPC$, ADMIN$, C$). Only disk shares returned by default.
 - **RPC version is 5.0**: Connection-oriented RPC. `PFC_FIRST_FRAG | PFC_LAST_FRAG` together mark a complete single-fragment PDU; a cleared `PFC_LAST_FRAG` means more fragments follow (see reassembly above).

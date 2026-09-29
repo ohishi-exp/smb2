@@ -33,7 +33,7 @@ One sub-module per SMB2 command. Each defines request and response structs with 
 
 ## Compound messages
 
-Built by `Connection::send_compound`. Each sub-request's header has a `NextCommand` field pointing to the next message (8-byte aligned). The last message has `NextCommand = 0`. Related operations use `FileId::SENTINEL` (`0xFFFFFFFF:0xFFFFFFFF`) so the server substitutes the handle from the first CREATE.
+Built by `Connection::execute_compound`. Each sub-request's header has a `NextCommand` field pointing to the next message (8-byte aligned). The last message has `NextCommand = 0`. Related operations use `FileId::SENTINEL` (`0xFFFFFFFF:0xFFFFFFFF`) so the server substitutes the handle from the first CREATE.
 
 ## Transform headers
 

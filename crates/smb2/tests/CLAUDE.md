@@ -69,7 +69,7 @@ Connect to the real NAS, send a NegotiateRequest, capture the server's raw respo
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against 15 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR. See `docs/specs/docker-test-infrastructure.md` for the full plan.
+Tests against 18 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
 
 Containers live in `tests/docker/internal/`.
 
@@ -105,6 +105,21 @@ cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
 | smb-weirdnames | 10459 | Names with SMB2-illegal characters. `populate.sh` writes them with octal escapes, so the on-disk bytes are exactly what macOS smbfs produces; a listing that decodes them proves Finder parity, which is the strongest assertion CI can make without a Mac. ❌ Don't replace those escapes with the literal characters. |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target, plus a seeded `Root-File.txt` in the root share itself (guest can't write there) for `resolve` on a DFS share |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |
+| smb-dfs-namespace | 10460 | A namespace root that refuses TREE_CONNECT (`msdfs root` + `msdfs proxy`): refusal → ROOT referral over IPC$ → target, the cache making the second connect one round trip, and a missing share (`STATUS_NOT_FOUND` on the referral) still reported as the original `STATUS_BAD_NETWORK_NAME` |
+| smb-dfs-failover | 10461 | The same root with two targets, the first unreachable: a dead target falls through to a live one |
+
+**What the DFS fixtures can't prove** (verified against Samba 4.20.6, 2026-09-16): that a Windows server behaves the
+same. Samba answers a root referral with `ServerType = 0` and header flags `0x02` where Windows answers `1` and `0x03`,
+so these fixtures are the stricter case for an accept-anything reading and would miss a regression that started
+requiring the Windows values. `windows_and_samba_shaped_root_referrals_resolve_the_same` (`src/client/mod.rs`) closes
+that gap on the mock; a real Windows namespace has never been tested. `smb-dfs-root` is the other shape entirely: a share that tree-connects and has an
+`msdfs:` link inside, which is the link path.
+
+**Why two Docker harnesses, not one.** The internal containers here ask "does the protocol implementation conform?";
+the consumer containers (below) ask "does your app handle the real world?". Some look alike (both have a flaky and a
+slow server), but they serve different goals and may drift apart, and a container is a 20-line Dockerfile, so keeping
+them separate is cheap. Also rejected: an in-process SMB server (credits, signing, and leases make it a second
+implementation to trust) and in-process network simulation (Docker networking plus `tc` is closer to the real thing).
 
 ## smol integration tests (`tests/smol_integration.rs`)
 

@@ -47,4 +47,10 @@ Calling a `*_client()` method for a container not in the current profile returns
 
 - **LazyLock statics never drop**: `TestServers::drop()` won't run at process exit. CI should use explicit cleanup steps.
 - **Flaky container has no health check**: The 5s-up/5s-down cycle means health checks would randomly fail. `wait_healthy()` skips it.
+- **The "windows" and "synology" containers fake a label, not a server.** Their `server string` shows up in srvsvc
+  RPC answers (what `list_shares` reads), never in NEGOTIATE, which carries no server identity. Underneath it's still
+  Samba on Alpine, so no Windows or DSM protocol quirk is reproduced; for real Windows, use the AWS AD setup in
+  `tests/CLAUDE.md`.
+- **No protocol-internals containers here** (signing, encryption, SMB1, DFS): consumers trust the crate for those, and
+  the internal harness covers them.
 - **DFS is disabled on test clients**: Consumer containers don't set up DFS. The `connect_guest` / `connect_auth` helpers set `dfs_enabled: false`.
