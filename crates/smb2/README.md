@@ -282,8 +282,8 @@ println!("{}", serde_json::to_string_pretty(&diag).unwrap());
 
 The snapshot is eventually consistent (each field is loaded independently), survives connection teardown, and is
 cheap (a handful of atomic loads + short critical sections). Counter semantics and the four-way routing partition are
-documented on `smb2::MetricsSnapshot`. See [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md) for the
-design.
+documented on `smb2::MetricsSnapshot`. The [`smb2::client::diagnostics`](https://docs.rs/smb2/latest/smb2/client/diagnostics/)
+module docs cover the design.
 
 Two runnable examples to see it in action:
 
@@ -462,7 +462,8 @@ which means system package management, cross-compilation headaches, and all the 
   Cmdr. If you distrust AI-generated code, that's fair, but please check the tests and decide for yourself.
 - The protocol implementation is based on
   Microsoft's [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/). I converted the
-  relevant sections to Markdown so AI agents could work from them effectively. The spec files live in `docs/specs/`.
+  relevant sections to Markdown so AI agents could work from them effectively. They aren't committed here; `AGENTS.md`
+  § "Spec files" shows how to fetch them.
 
 ## Contributing
 

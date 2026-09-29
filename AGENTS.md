@@ -171,7 +171,7 @@ benchmarks/               # Excluded from the workspace; each has its own lockfi
   smb/                    # Throughput vs the `smb` crate
   smb-listing/            # Directory-listing comparison
   cli-bulk-ops/           # Mount vs SSH vs `smb2-cli -j N` on bulk metadata ops
-docs/                     # Specs, release process, migration notes, benchmark findings
+docs/                     # Design decisions, release process, migration notes, benchmarks, evidence notes (notes/)
 ```
 
 Mock-transport protocol flows (negotiate -> session -> tree -> file, DFS resolution, reconnection) live beside the code
@@ -232,22 +232,25 @@ implementations.
 construction that owns the read half, demultiplexes each incoming frame to the matching request's
 `oneshot::Sender<Frame>` (keyed by `MessageId`), and handles decrypt/decompress/sign-verify/credits/PENDING-loop/
 oplock-break/session-expiry centrally. Dropping a caller's future drops its `oneshot::Receiver`; the receiver task
-discards the late-arriving response silently. See `docs/specs/connection-actor.md` for the full design and
-`src/client/CLAUDE.md` § "Connection internals: receiver task + `oneshot` routing" for the architectural sketch.
+discards the late-arriving response silently. See `docs/connection-actor.md` for the decisions behind it and
+`src/client/CLAUDE.md` § "Connection internals: receiver task + `oneshot` routing" for how it works.
 
 ## Key design decisions
 
 | Decision             | Choice                                     | Why                                                                  |
 |----------------------|--------------------------------------------|----------------------------------------------------------------------|
+| Fork vs. rewrite     | Rewritten from scratch, not forked from smb-rs | smb-rs had almost no tests, a different architecture, and an MIT-only license |
 | Binary serialization | Hand-rolled `ReadCursor`/`WriteCursor`     | Full control, debuggable, no proc-macro dep                          |
 | Async strategy       | `dyn Transport` + `async_trait`            | Simpler public API than generics                                     |
 | Async runtime        | tokio (default) or smol, picked per call   | Every reactor call goes through crate-private `rt/`; see its CLAUDE.md |
 | ID types             | Newtypes (`SessionId(u64)`, etc.)          | Zero-cost compile-time safety                                        |
 | Error handling       | Rich context + `is_retryable()` + NTSTATUS | mtp-rs style                                                         |
-| Transport trait      | Split send/receive                         | Avoids deadlock in pipeline's `select!` loop                         |
+| Transport trait      | Split send/receive                         | The writer task and the receiver task each own one half, so a send never waits on a receive |
 | Workspace            | Library + CLI crates                       | A library change and the CLI change it needs land in one commit      |
 | I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
-| Batch operations     | Send-all-then-receive-all for multi-file ops | No new infra needed -- N `send_compound` + N `receive_compound`    |
+| Batch operations     | Loops over the single-item calls           | Convenience, not throughput; see `client/CLAUDE.md` § Batch operations |
+| Compression          | Unchained LZ4 only (`lz4_flex`, pure Rust) | LZNT1 is legacy, and chained compression is rarely used              |
+| Scope                | Client only, SMB 2.0.2 and up, TCP only    | No server, no SMB1, no QUIC or RDMA; see `crates/smb2/README.md` § Limitations |
 | Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
 | Primary reference    | MS-SMB2 spec (~80%)                        | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |
 
@@ -261,24 +264,24 @@ discover a new pitfall that involves 2+ modules, add it to this list.
    the preauth hash. Including it produces wrong keys. See `session.rs`.
 2. **Compound partial failure** ✅ -- Standalone CLOSE issued when CREATE succeeds but a later op fails. See `tree.rs`
    compound methods.
-3. **Consecutive MessageIds** ✅ -- `send_request_with_credits()` advances MessageId by CreditCharge. See
+3. **Consecutive MessageIds** ✅ -- `execute_with_credits()` advances MessageId by CreditCharge. See
    `connection.rs`.
 4. **Signing/encryption mutual exclusion** ✅ -- When encrypting, Signature is zeroed, AEAD provides auth. See
    `connection.rs` send/receive paths.
 5. **TCP framing is big-endian** ✅ -- 0x00 + 3-byte BE length. Only big-endian thing in SMB. See `transport/tcp.rs`.
-6. **STATUS_PENDING loop** ✅ -- `receive_response()` loops past interim responses, extracting credits. See
-   `connection.rs`.
+6. **STATUS_PENDING loop** ✅ -- The receiver task keeps the waiter past interim responses, banking their credits.
+   See `connection.rs`.
 7. **CANCEL two modes, and a nonce bit that makes or breaks both** ✅ -- `send_cancel()` handles sync (MessageId) and async (AsyncId + flag); a request the server has answered with an interim STATUS_PENDING has an AsyncId and can ONLY be cancelled by it (MS-SMB2 § 3.2.4.24), which is why `Waiter` records it and `OutstandingRequest` exposes it. Under AES-GMAC the signature nonce carries a "this is a CANCEL" bit (§ 3.1.4.1) on both the sign and the verify path; without it a GMAC-negotiating server refuses the cancel, and since a cancel has no success response the client sees nothing and believes it let go of a request the server still holds. Spans `client/connection.rs` + `crypto/signing.rs`; see `crypto/CLAUDE.md`.
-8. **Session expiry** ✅ -- `receive_response()` detects STATUS_NETWORK_SESSION_EXPIRED, returns `Error::SessionExpired`.
+8. **Session expiry** ✅ -- The receiver task routes STATUS_NETWORK_SESSION_EXPIRED to its waiter as `Error::SessionExpired`.
    Caller reconnects. See `connection.rs`.
 9. **Compound encryption wraps entire chain** ✅ -- One TRANSFORM_HEADER for concatenated compound. See `connection.rs`
-   `send_compound()`.
+   `execute_compound()`.
 10. **STATUS_BUFFER_OVERFLOW** ✅ -- Accepted as partial success in QueryInfo responses via `is_success_or_partial()`.
     See `tree.rs`.
 11. **Oplock break notifications** ✅ -- Detected by MessageId 0xFFFF..., logged, skipped. See `connection.rs` receive
     loop.
 12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
-13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). Compound-using methods call `Connection::receive_compound_expected(n)`, which gathers additional frames transparently. See `connection.rs` + `tree.rs`.
+13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). The receiver task routes each sub-response by its `MessageId`, so `Connection::execute_compound` reassembles a split chain in submission order without noticing. Nothing counts or logs a split. See `connection.rs` + `tree.rs`.
 14. **Credits are spent on send, not on receipt** ✅ -- `client/credits.rs` reserves a request's `CreditCharge` before its bytes reach the wire; only a `CreditResponse` grant puts credits back. Charging on the response instead leaves every in-flight request invisible, so concurrent pipelined streams over one connection each spend the same budget and blow past the server's window. MS-SMB2 § 3.3.1.1 lets a server drop such a client; a QNAP TS-464 instead stopped answering while TCP stayed `ESTABLISHED` (2026-07-31, reproduced twice). A short send parks on a bounded wait and surfaces `Error::CreditStarvation` rather than hanging. Spans `client/credits.rs` + `client/connection.rs` + the pipelined reads in `client/tree.rs` and `client/stream.rs` + `client/write_pipe.rs`.
 15. **A silent server must not hang a caller** ✅ -- `Connection::await_response` gives up after 30 s without a sign of life. The clock measures silence, not elapsed time: it starts when the frame reaches the wire (`mark_sent`) and interim `STATUS_PENDING` frames refresh `Waiter.last_activity` (MS-SMB2 § 3.2.5.1.5), so an acknowledged operation is never cut short however long it runs — that refresh is the whole reason the deadline can be this short. Long-poll CHANGE_NOTIFY is exempt. See `client/CLAUDE.md` § Response deadline.
 16. **Getting ONTO the wire is bounded, not just getting a reply** ✅ -- A dedicated writer task (`client/connection.rs`
@@ -308,7 +311,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 24. **Silence you weren't listening to is not evidence** ✅ -- Every liveness clock here measures wall time, which quietly assumes the process was running to hear the silence it is measuring. It isn't always: a system sleep, an App Nap, or a machine starved by a parallel build stops the loops while `Instant` keeps advancing, and the wire then reads as silent for minutes because nobody was listening. Cmdr hit this three times in twelve minutes on 2026-08-08 (62 s, 175 s, 355 s of a fully frozen process, each ending in a declared-dead session against a NAS that had been answering the whole time); a closed laptop lid is the same shape, so it is a user-facing case rather than a dev-box one. `Inner::forgive_scheduling_stall` catches it with the one witness available for free: cadence. Every loop on a connection wakes on a `keepalive_tick` or faster, so a gap since the last one that exceeds the probe threshold on top of the tick is us, not the server -- and forgiving it shifts `last_frame_at` and every waiter's timestamps forward by the gap, which is exactly the statement "nothing aged while we were gone". ❌ Don't leave the check to the keepalive task alone: every wait loop wakes from the same stall at the same instant, so `await_response` and `await_long_poll` each call it before reading any clock (it is idempotent; whoever arrives first corrects). ⚠️ It forgives, it never exonerates -- the probes restart with the clocks and a genuinely dead server is declared dead one budget later, because suppressing the verdict would trade a false death for a permanent hang. Counted as `scheduling_stalls`, logged at `info`. Spans `client/connection.rs`; see `client/CLAUDE.md` § Liveness.
 
-25. **A DFS namespace root is not a share, and `STATUS_BAD_NETWORK_NAME` means three different things** ✅ -- `\\<domain>\<namespace>` is MS-DFSC § 2.2.1.4's *preferred* form for a domain-based namespace, and it cannot be tree-connected: it is not a share on the server answering that name, so the server refuses it with `STATUS_BAD_NETWORK_NAME` (MS-SMB2 § 3.3.5.7 requires exactly that, so it is a contract, not a Windows quirk). The reactive DFS path keys off `STATUS_PATH_NOT_COVERED`, which a server can only send once a share has tree-connected, so the whole resolver was unreachable for this shape and a consumer read it as "the server exists, the share does not" — the one thing that isn't true. `SmbClient::connect_share` now answers that refusal with a ROOT referral over IPC$. Three traps, all of them load-bearing: ❌ **nothing may gate on `ServerType`** — Samba answers a root referral with `0` and header flags `0x02` where Windows answers `1` and `0x03` (verified against Samba 4.20.6, 2026-09-16), so a client requiring the Windows values works against Windows and silently refuses every Samba namespace; ❌ **a failed referral must never replace the original error**, because the overwhelmingly common cause of `STATUS_BAD_NETWORK_NAME` is a mistyped share name and telling that person about DFS is worse than telling them nothing (only `Error::DfsNoReachableTarget` — the namespace is real, its storage is not reachable — reports differently); and the same status *also* carries an `SMB2_ERROR_ID_SHARE_REDIRECT` error context for scale-out cluster redirection (MS-SMB2 § 2.2.2.2.2), an unrelated mechanism this crate doesn't implement, which `Tree::connect` separates out as `Error::ShareRedirected` so the DFS trigger can't fire on it. Spans `client/mod.rs` + `client/dfs.rs` + `client/tree.rs` + `msg/dfs.rs`; see `client/CLAUDE.md` § DFS and `docs/specs/dfs-namespace-root-plan.md`.
+25. **A DFS namespace root is not a share, and `STATUS_BAD_NETWORK_NAME` means three different things** ✅ -- `\\<domain>\<namespace>` is MS-DFSC § 2.2.1.4's *preferred* form for a domain-based namespace, and it cannot be tree-connected: it is not a share on the server answering that name, so the server refuses it with `STATUS_BAD_NETWORK_NAME` (MS-SMB2 § 3.3.5.7 requires exactly that, so it is a contract, not a Windows quirk). The reactive DFS path keys off `STATUS_PATH_NOT_COVERED`, which a server can only send once a share has tree-connected, so the whole resolver was unreachable for this shape and a consumer read it as "the server exists, the share does not" — the one thing that isn't true. `SmbClient::connect_share` now answers that refusal with a ROOT referral over IPC$. Three traps, all of them load-bearing: ❌ **nothing may gate on `ServerType`** — Samba answers a root referral with `0` and header flags `0x02` where Windows answers `1` and `0x03` (verified against Samba 4.20.6, 2026-09-16), so a client requiring the Windows values works against Windows and silently refuses every Samba namespace; ❌ **a failed referral must never replace the original error**, because the overwhelmingly common cause of `STATUS_BAD_NETWORK_NAME` is a mistyped share name and telling that person about DFS is worse than telling them nothing (only `Error::DfsNoReachableTarget` — the namespace is real, its storage is not reachable — reports differently); and the same status *also* carries an `SMB2_ERROR_ID_SHARE_REDIRECT` error context for scale-out cluster redirection (MS-SMB2 § 2.2.2.2.2), an unrelated mechanism this crate doesn't implement, which `Tree::connect` separates out as `Error::ShareRedirected` so the DFS trigger can't fire on it. Spans `client/mod.rs` + `client/dfs.rs` + `client/tree.rs` + `msg/dfs.rs`; see `client/CLAUDE.md` § DFS.
 
 26. **A response still arriving is the server talking** ✅ -- A transport hands over a frame only once it is whole, and TCP delivers in order, so a large response trickling in over a slow link holds the whole inbound stream: an 8 MB READ at 200 KB/s is 40 s during which nothing else can arrive, ECHO replies included. With only whole frames feeding the liveness clock, that looked like 40 s of total silence with every probe unanswered, and the read ended in `Error::ServerUnresponsive` with the connection torn down under every other caller. `TcpTransport` now publishes each socket read to a `ReceiveProgress` (counts and a timestamp, never the unverified bytes), and `Inner::last_heard` folds it into the liveness clock. The same counts are what `Connection::inbound()` and `Connection::liveness()` expose to consumers. ❌ The `Arc<T>` blanket impl must forward `receive_progress`, or every `Connection::connect` quietly loses it. Spans `transport/progress.rs` + `transport/tcp.rs` + `client/connection.rs`; see `client/CLAUDE.md` § Liveness, including the known limit it leaves.
 
@@ -457,7 +460,8 @@ reconnect too (which revives the connection in place rather than replacing it), 
 of the link. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
 it is still queued for the transport, so the server has not been asked and nothing about the server follows from it. `OutstandingRequest::async_id` is what a `Connection::send_cancel` for that request has to carry. `Display` impl for terminal output; optional `serde` feature for JSON.
 
-Spec: [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md). Quick smoke test:
+Design rationale (why a snapshot and no event stream, what it leaves out): the `src/client/diagnostics.rs` module docs.
+Quick smoke test:
 
 ```sh
 SMB2_PASS=secret cargo run -p smb2 --example diagnostics
@@ -540,9 +544,6 @@ curl -sfL "https://raw.githubusercontent.com/awakecoding/openspecs/publish/$S/$S
   -o "related-repos/openspecs/skills/windows-protocols/$S/$S.md"
 ```
 
-- Implementation plan: `docs/specs/implementation-plan.md`
-- DFS: `docs/specs/dfs-implementation-plan.md` (the reactive link path, shipped) and
-  `docs/specs/dfs-namespace-root-plan.md` (namespace roots, referral-parser gaps, and the TCP connect budget)
 - MS-SMB2 spec: `related-repos/openspecs/skills/windows-protocols/MS-SMB2/MS-SMB2.md`
 - MS-ERREF (NTSTATUS codes): `related-repos/openspecs/skills/windows-protocols/MS-ERREF/MS-ERREF.md`
 - MS-DTYP (data types): `related-repos/openspecs/skills/windows-protocols/MS-DTYP/MS-DTYP.md`

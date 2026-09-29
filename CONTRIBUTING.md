@@ -124,7 +124,7 @@ These might come later, but they're not the current focus.
 
 ## The protocol
 
-If you need to understand SMB2/3, the spec files in `docs/specs/` are the primary reference. The implementation plan at `docs/specs/implementation-plan.md` has a good overview of the protocol flow and known pitfalls.
+If you need to understand SMB2/3, Microsoft's MS-SMB2 spec is the primary reference (`AGENTS.md` § "Spec files" shows how to fetch a local copy). The protocol pitfalls in `AGENTS.md` are a good overview of what trips implementations up.
 
 The protocol is essentially:
 
