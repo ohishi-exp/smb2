@@ -117,7 +117,6 @@ A few things that might not be obvious:
 
 - Server implementation (this is a client library)
 - QUIC or RDMA transport
-- Kerberos authentication (planned but not yet)
 - SMB1 support (deprecated, insecure)
 
 These might come later, but they're not the current focus.

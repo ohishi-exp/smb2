@@ -216,7 +216,7 @@ Both changes come from a grid of 28 shaped links plus a real-NAS validation, wri
   - ❌ **A failed referral never replaces the original error.** The overwhelmingly common cause of `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them nothing. The only outcome that reports differently is `Error::DfsNoReachableTarget`: the namespace is real, we found it, its storage is out of reach.
   - A namespace resolved once is cached, so the refused tree connect and the referral are paid once per TTL rather than once per connect. An ordinary share on a DFS-capable server still costs exactly one tree connect.
 
-- **`Tree::dfs_origin: Option<DfsOrigin>`** carries both the name the caller asked for and the target the tree landed on. Show `requested`, not `server`: a person who typed `\\lgs-net.com\aleu` should not be shown `\\fs01\aleu_dfs`, and macOS reports `SERVER_NAME lgs-net.com` for exactly this mount.
+- **`Tree::dfs_origin: Option<DfsOrigin>`** carries both the name the caller asked for and the target the tree landed on. Show `requested`, not `server`: a person who typed `\\corp.example.com\projects` should not be shown `\\fs01\projects_dfs`, and macOS reports `SERVER_NAME corp.example.com` for exactly this mount.
 
 - **`ConnectOptions` + `TcpTransport::connect_with` / `Connection::connect_with`**, and `ClientConfig::connect_options`, for tuning how a connect is spread across a name's addresses.
 

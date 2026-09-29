@@ -247,17 +247,17 @@ pub struct FsInfo {
 
 /// Where a tree came from, when a DFS referral put it somewhere else.
 ///
-/// A file manager showing `\\fs01\aleu_dfs` for a path the person typed as
-/// `\\lgs-net.com\aleu` is showing them a server they have never heard of.
+/// A file manager showing `\\fs01\projects_dfs` for a path the person typed as
+/// `\\corp.example.com\projects` is showing them a server they have never heard of.
 /// Every other client keeps the requested name (macOS reports
-/// `SERVER_NAME lgs-net.com` for exactly this mount), so a library that threw
+/// `SERVER_NAME corp.example.com` for exactly this mount), so a library that threw
 /// it away would make every consumer shadow it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DfsOrigin {
-    /// The UNC path the caller asked for, for example `\\lgs-net.com\aleu`.
+    /// The UNC path the caller asked for, for example `\\corp.example.com\projects`.
     pub requested: String,
     /// The referral target this tree actually sits on, for example
-    /// `\\fs01\aleu_dfs`.
+    /// `\\fs01\projects_dfs`.
     pub target: String,
 }
 
@@ -3200,7 +3200,7 @@ mod tests {
     fn a_dfs_prefix_keeps_a_whole_ipv6_host() {
         let tree = |server: &str| Tree {
             tree_id: TreeId(1),
-            share_name: "aleu".to_string(),
+            share_name: "projects".to_string(),
             server: server.to_string(),
             is_dfs: true,
             encrypt_data: false,
@@ -3209,18 +3209,18 @@ mod tests {
 
         assert_eq!(
             tree("[fe80::1]:445").format_path("Docs/Report.pdf"),
-            r"fe80::1\aleu\Docs\Report.pdf"
+            r"fe80::1\projects\Docs\Report.pdf"
         );
         assert_eq!(
             tree("fe80::1:445").format_path("Docs/Report.pdf"),
-            r"fe80::1\aleu\Docs\Report.pdf"
+            r"fe80::1\projects\Docs\Report.pdf"
         );
         assert_eq!(
-            tree("lgs-net.com:445").format_path("Docs/Report.pdf"),
-            r"lgs-net.com\aleu\Docs\Report.pdf"
+            tree("corp.example.com:445").format_path("Docs/Report.pdf"),
+            r"corp.example.com\projects\Docs\Report.pdf"
         );
         // The share root, where there is no path to eat into.
-        assert_eq!(tree("[::1]:445").format_path(""), r"::1\aleu");
+        assert_eq!(tree("[::1]:445").format_path(""), r"::1\projects");
         // A non-DFS tree sends a share-relative path and no prefix at all.
         let mut plain = tree("[::1]:445");
         plain.is_dfs = false;

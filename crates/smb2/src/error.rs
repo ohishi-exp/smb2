@@ -172,7 +172,7 @@ pub enum Error {
     #[error("DFS namespace {namespace} resolved to {target_count} target(s), none reachable")]
     DfsNoReachableTarget {
         /// The namespace path the caller asked for, for example
-        /// `\\lgs-net.com\aleu`.
+        /// `\\corp.example.com\projects`.
         namespace: String,
         /// How many targets the referral offered.
         target_count: usize,

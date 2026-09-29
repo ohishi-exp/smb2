@@ -468,8 +468,8 @@ impl SmbClient {
     /// # DFS namespace roots
     ///
     /// `share_name` may be a **DFS namespace** rather than a share on this
-    /// server — `\\lgs-net.com\aleu`, where `lgs-net.com` is a domain name and
-    /// `aleu` is the namespace. There is no such share to tree-connect, so the
+    /// server — `\\corp.example.com\projects`, where `corp.example.com` is a domain name and
+    /// `projects` is the namespace. There is no such share to tree-connect, so the
     /// server refuses with `STATUS_BAD_NETWORK_NAME`; this method then asks it
     /// for a root referral and connects the target the referral names, on
     /// whichever server that turns out to be. The returned `Tree` carries a
@@ -2320,25 +2320,25 @@ mod tests {
         // ServerType 0 and StorageServers alone.
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
-            &[r"\test-server\aleu_dfs"],
+            r"\test-server\projects",
+            &[r"\test-server\projects_dfs"],
             0x02,
         ));
         // And the tree connect to the target share.
         mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
 
         let tree = client
-            .connect_share("aleu")
+            .connect_share("projects")
             .await
             .expect("a namespace root must resolve");
 
         assert_eq!(tree.tree_id, TreeId(9));
-        assert_eq!(tree.share_name, "aleu_dfs");
+        assert_eq!(tree.share_name, "projects_dfs");
         assert_eq!(
             tree.dfs_origin,
             Some(DfsOrigin {
-                requested: r"\\test-server\aleu".to_string(),
-                target: r"\\test-server\aleu_dfs".to_string(),
+                requested: r"\\test-server\projects".to_string(),
+                target: r"\\test-server\projects_dfs".to_string(),
             }),
             "the caller's own name for the namespace has to survive the redirect"
         );
@@ -2375,20 +2375,20 @@ mod tests {
             mock.queue_response(build_referral(
                 version,
                 server_type,
-                r"\test-server\aleu",
-                &[r"\test-server\aleu_dfs"],
+                r"\test-server\projects",
+                &[r"\test-server\projects_dfs"],
                 header_flags,
             ));
             mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
 
             let tree = client
-                .connect_share("aleu")
+                .connect_share("projects")
                 .await
                 .unwrap_or_else(|e| panic!("a {who}-shaped root referral must resolve: {e}"));
-            assert_eq!(tree.share_name, "aleu_dfs", "{who}");
+            assert_eq!(tree.share_name, "projects_dfs", "{who}");
             assert_eq!(
                 tree.dfs_origin.as_ref().map(|o| o.requested.as_str()),
-                Some(r"\\test-server\aleu"),
+                Some(r"\\test-server\projects"),
                 "{who}"
             );
         }
@@ -2434,9 +2434,9 @@ mod tests {
             false,
         ));
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
-        mock.queue_response(build_root_referral(r"\test-server\aleu", &[], 0x02));
+        mock.queue_response(build_root_referral(r"\test-server\projects", &[], 0x02));
 
-        let err = client.connect_share("aleu").await.unwrap_err();
+        let err = client.connect_share("projects").await.unwrap_err();
         assert!(matches!(
             err,
             Error::Protocol {
@@ -2461,14 +2461,14 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
         // Hop 1: an interlink into a second namespace.
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
+            r"\test-server\projects",
             &[r"\test-server\elsewhere"],
             0x01,
         ));
         // Hop 2: nothing there.
         mock.queue_response(build_root_referral(r"\test-server\elsewhere", &[], 0x02));
 
-        let err = client.connect_share("aleu").await.unwrap_err();
+        let err = client.connect_share("projects").await.unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2495,7 +2495,7 @@ mod tests {
         ));
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
+            r"\test-server\projects",
             &[r"\test-server\one", r"\test-server\two"],
             0x02,
         ));
@@ -2503,14 +2503,14 @@ mod tests {
         mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
         mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
 
-        let err = client.connect_share("aleu").await.unwrap_err();
+        let err = client.connect_share("projects").await.unwrap_err();
         match err {
             Error::DfsNoReachableTarget {
                 namespace,
                 target_count,
                 ..
             } => {
-                assert_eq!(namespace, r"\\test-server\aleu");
+                assert_eq!(namespace, r"\\test-server\projects");
                 assert_eq!(target_count, 2);
             }
             other => panic!("expected DfsNoReachableTarget, got {other:?}"),
@@ -2531,17 +2531,17 @@ mod tests {
         ));
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
-            &[r"\test-server\aleu_dfs"],
+            r"\test-server\projects",
+            &[r"\test-server\projects_dfs"],
             0x02,
         ));
         mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
 
-        client.connect_share("aleu").await.unwrap();
+        client.connect_share("projects").await.unwrap();
         let after_first = mock.sent_count();
 
         mock.queue_response(build_tree_connect_response(TreeId(10), ShareType::Disk));
-        let tree = client.connect_share("aleu").await.unwrap();
+        let tree = client.connect_share("projects").await.unwrap();
 
         assert_eq!(tree.tree_id, TreeId(10));
         assert!(tree.dfs_origin.is_some());
@@ -2601,7 +2601,7 @@ mod tests {
         ));
         let before = mock.sent_count();
 
-        let err = client.connect_share("aleu").await.unwrap_err();
+        let err = client.connect_share("projects").await.unwrap_err();
         assert!(matches!(
             err,
             Error::Protocol {
@@ -2627,7 +2627,7 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
         // R set, S clear: an interlink pointing at a second namespace.
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
+            r"\test-server\projects",
             &[r"\test-server\elsewhere"],
             0x01,
         ));
@@ -2639,11 +2639,11 @@ mod tests {
         ));
         mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
 
-        let tree = client.connect_share("aleu").await.unwrap();
+        let tree = client.connect_share("projects").await.unwrap();
         assert_eq!(tree.share_name, "real_share");
         assert_eq!(
             tree.dfs_origin.unwrap().requested,
-            r"\\test-server\aleu",
+            r"\\test-server\projects",
             "the caller's name survives however many hops it took"
         );
     }
@@ -2663,15 +2663,15 @@ mod tests {
         // An interlink naming its own namespace. The cache answers every hop
         // after the first, so this is one frame and eight hops.
         mock.queue_response(build_root_referral(
-            r"\test-server\aleu",
-            &[r"\test-server\aleu"],
+            r"\test-server\projects",
+            &[r"\test-server\projects"],
             0x01,
         ));
 
-        let err = client.connect_share("aleu").await.unwrap_err();
+        let err = client.connect_share("projects").await.unwrap_err();
         match err {
             Error::DfsTooManyReferrals { namespace, hops } => {
-                assert_eq!(namespace, r"\\test-server\aleu");
+                assert_eq!(namespace, r"\\test-server\projects");
                 assert_eq!(hops, MAX_DFS_HOPS);
             }
             other => panic!("expected DfsTooManyReferrals, got {other:?}"),
@@ -3221,7 +3221,7 @@ mod tests {
             // (address, host)
             ("192.168.1.111:445", "192.168.1.111"),
             ("naspolya.local:445", "naspolya.local"),
-            ("lgs-net.com:445", "lgs-net.com"),
+            ("corp.example.com:445", "corp.example.com"),
             // Bracketed: the brackets say where the literal ends, and come off.
             ("[::1]:445", "::1"),
             ("[2001:db8::5]:445", "2001:db8::5"),

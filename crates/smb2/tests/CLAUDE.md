@@ -54,8 +54,8 @@ cargo test -p smb2 --test integration -- --ignored --nocapture
   too: a run interrupted mid-test leaves a file behind, and a write over an existing file is a `modified` rather than
   an `Added`.
 - **Gear that is absent skips, it does not fail.** `skip_unless!` prints what is missing and returns. The AWS Windows
-  AD DC is an on-demand EC2 instance and the Docker KDC was abandoned entirely, so panicking on them left `just
-  check-live` permanently red, which is how a suite stops being read.
+  AD DC is an on-demand EC2 instance (Samba's AD DC doesn't run on macOS, so there's no Docker KDC), and panicking on
+  it left `just check-live` permanently red, which is how a suite stops being read.
 
 **What they cover:** Connect, negotiate, auth (NTLM + guest), tree connect, list directory, read/write/delete file, stat, create/delete directory, compound read/write, pipelined I/O, streaming download/upload with progress, reconnect, share enumeration, file watching, disk space, rename, and filenames carrying characters SMB2 forbids (`nas_stores_an_illegal_name_the_way_macos_does`, against real QNAP firmware rather than a container). Also a micro-benchmark comparing smb2 vs native macOS SMB.
 

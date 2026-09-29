@@ -240,7 +240,7 @@ with the resolved remaining path.
   `SMB2_ERROR_ID_SHARE_REDIRECT` context for scale-out cluster redirection. `Tree::connect` separates it out, so the
   namespace trigger can't fire on it by construction.
 - **`Tree::dfs_origin` keeps the caller's own name for a redirected tree.** Show `requested`, not `server`: a person
-  who typed `\\lgs-net.com\aleu` should not be shown `\\fs01\aleu_dfs`, and macOS reports `SERVER_NAME lgs-net.com`
+  who typed `\\corp.example.com\projects` should not be shown `\\fs01\projects_dfs`, and macOS reports `SERVER_NAME corp.example.com`
   for exactly this mount.
 - **`TargetHint`** (§ 3.1.1): the target that worked is tried first next time, so a failover survives the next lookup
   instead of re-walking the dead target on every operation.

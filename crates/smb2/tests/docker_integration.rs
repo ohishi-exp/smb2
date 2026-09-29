@@ -5346,7 +5346,7 @@ async fn dfs_namespace_root_connects_through_a_referral() {
 
     let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
     let tree = client
-        .connect_share("aleu")
+        .connect_share("projects")
         .await
         .expect("the namespace root must resolve to its target");
 
@@ -5359,7 +5359,7 @@ async fn dfs_namespace_root_connects_through_a_referral() {
         .dfs_origin
         .as_ref()
         .expect("a redirected tree must carry its origin");
-    assert_eq!(origin.requested, r"\\127.0.0.1\aleu");
+    assert_eq!(origin.requested, r"\\127.0.0.1\projects");
     assert_eq!(origin.target, r"\\smb-dfs-target\files");
 }
 
@@ -5370,7 +5370,10 @@ async fn dfs_namespace_root_reads_a_file_from_the_target() {
     let _ = env_logger::try_init();
 
     let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
-    let mut tree = client.connect_share("aleu").await.expect("connect_share");
+    let mut tree = client
+        .connect_share("projects")
+        .await
+        .expect("connect_share");
 
     let data = client
         .read_file(&mut tree, "hello.txt")
@@ -5398,11 +5401,17 @@ async fn dfs_namespace_root_is_cached_after_the_first_connect() {
     let _ = env_logger::try_init();
 
     let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
-    client.connect_share("aleu").await.expect("first connect");
+    client
+        .connect_share("projects")
+        .await
+        .expect("first connect");
     let after_first = client.diagnostics().client.metrics.dfs_referrals_resolved;
     assert_eq!(after_first, 1, "the first connect resolves one referral");
 
-    let tree = client.connect_share("aleu").await.expect("second connect");
+    let tree = client
+        .connect_share("projects")
+        .await
+        .expect("second connect");
     assert!(tree.dfs_origin.is_some());
 
     let metrics = client.diagnostics().client.metrics;
@@ -5475,7 +5484,7 @@ async fn dfs_namespace_root_falls_through_to_a_live_target() {
 
     let mut client = dfs_namespace_client(DFS_FAILOVER_ADDR).await;
     let mut tree = client
-        .connect_share("aleu")
+        .connect_share("projects")
         .await
         .expect("the second target must be reached");
 
