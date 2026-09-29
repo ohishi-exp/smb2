@@ -6,6 +6,7 @@
 //! for batched concurrent operations.
 
 pub mod connection;
+mod connections;
 pub mod copy;
 pub(crate) mod credits;
 pub(crate) mod dfs;
@@ -57,7 +58,6 @@ pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
 
-use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -71,6 +71,7 @@ use crate::rpc::srvsvc::ShareInfo;
 use crate::types::status::NtStatus;
 use crate::types::FileId;
 use crate::Error;
+use connections::{ConnectionEntry, Connections};
 
 /// Configuration for an SMB client connection.
 #[derive(Debug, Clone)]
@@ -332,21 +333,6 @@ fn no_connection_results<T>(len: usize) -> Vec<Result<T>> {
     (0..len).map(|_| Err(Error::Disconnected)).collect()
 }
 
-/// A connection to a specific server with its authenticated session.
-///
-/// Used for DFS cross-server referrals where the client needs connections
-/// to multiple servers simultaneously.
-#[allow(dead_code)]
-pub(crate) struct ConnectionEntry {
-    /// The connection to the server.
-    pub conn: Connection,
-    /// The session as of the last authentication on this connection. Behind
-    /// an `Arc` for the same reason the primary's is: a revival can establish
-    /// a new one behind this client's back, and share encryption derives from
-    /// the live keys.
-    pub session: std::sync::Arc<Session>,
-}
-
 /// High-level SMB2 client with reconnection support.
 ///
 /// Wraps a [`Connection`] + [`Session`] and provides methods for connecting
@@ -357,15 +343,14 @@ pub(crate) struct ConnectionEntry {
 /// Drop the `SmbClient` when no longer needed.
 pub struct SmbClient {
     config: ClientConfig,
-    conn: Connection,
+    /// The primary connection and the DFS pool. ❌ A method holding a `Tree`
+    /// reaches its connection through `connections.for_tree`, never the
+    /// primary directly (`connections.rs`).
+    connections: Connections,
     /// The session as of the last authentication. Behind an `Arc` because a
     /// revival can establish a new one behind this client's back; every
     /// `&mut self` path that reads the session keys refreshes it first.
     session: std::sync::Arc<Session>,
-    /// Server name of the primary connection (from `conn.server_name()`).
-    primary_server: String,
-    /// Extra connections for DFS cross-server targets, keyed by server name.
-    extra_connections: HashMap<String, ConnectionEntry>,
     /// DFS referral resolver with TTL-based cache.
     dfs_resolver: DfsResolver,
     /// Client-level counter: how many times `reconnect()` ran. Survives
@@ -407,10 +392,8 @@ impl SmbClient {
 
         Ok(SmbClient {
             config,
-            conn,
+            connections: Connections::new(conn, primary_server),
             session: std::sync::Arc::new(session),
-            primary_server,
-            extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
         })
@@ -422,10 +405,8 @@ impl SmbClient {
         let primary_server = config.addr.clone();
         SmbClient {
             config,
-            conn,
+            connections: Connections::new(conn, primary_server),
             session: std::sync::Arc::new(session),
-            primary_server,
-            extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
         }
@@ -438,7 +419,7 @@ impl SmbClient {
     /// activates share encryption from these keys, and the previous session's
     /// keys decrypt nothing — every frame afterwards fails.
     fn refresh_session(&mut self) {
-        if let Some(current) = self.conn.current_session() {
+        if let Some(current) = self.connections.primary().current_session() {
             if current.session_id != self.session.session_id {
                 debug!(
                     "smb_client: adopting session {} established by a reconnect \
@@ -456,7 +437,7 @@ impl SmbClient {
     /// named pipe, and returns only disk shares (excluding admin shares
     /// ending with `$`).
     pub async fn list_shares(&mut self) -> Result<Vec<ShareInfo>> {
-        shares::list_shares(&mut self.conn).await
+        shares::list_shares(self.connections.primary_mut()).await
     }
 
     /// Connect to a share on the server.
@@ -504,10 +485,10 @@ impl SmbClient {
 
         // § 3.1.4.1 step 8 for the ordinary world: tree-connect, and on
         // success we are done at zero extra cost.
-        let refusal = match Tree::connect(&mut self.conn, share_name).await {
+        let refusal = match Tree::connect(self.connections.primary_mut(), share_name).await {
             Ok(mut tree) => {
-                tree.server = self.primary_server.clone();
-                activate_share_encryption(&mut self.conn, &self.session, &tree);
+                tree.server = self.connections.primary_server().to_string();
+                activate_share_encryption(self.connections.primary_mut(), &self.session, &tree);
                 return Ok(tree);
             }
             Err(err) => err,
@@ -520,7 +501,7 @@ impl SmbClient {
         debug!(
             "dfs: {share_name:?} is not a share on {}, and the server speaks DFS; \
              asking it for a root referral",
-            self.primary_server
+            self.connections.primary_server()
         );
         match self.connect_namespace(&requested).await {
             Ok(tree) => Ok(tree),
@@ -541,7 +522,11 @@ impl SmbClient {
 
     /// The UNC path for a share on the primary server, as a referral names it.
     fn unc_for(&self, share_name: &str) -> String {
-        format!(r"\\{}\{}", host_of(&self.primary_server), share_name)
+        format!(
+            r"\\{}\{}",
+            host_of(self.connections.primary_server()),
+            share_name
+        )
     }
 
     /// Whether a refused `TREE_CONNECT` might be a DFS namespace root rather
@@ -566,7 +551,7 @@ impl SmbClient {
                     command: crate::types::Command::TreeConnect,
                 }
             )
-            && self.conn.params().is_some_and(|p| {
+            && self.connections.primary().params().is_some_and(|p| {
                 p.capabilities
                     .contains(crate::types::flags::Capabilities::DFS)
             })
@@ -682,20 +667,8 @@ impl SmbClient {
         let host = host.split('\\').next().unwrap_or(host);
         let addr = self.dfs_addr_for_host(host);
 
-        if addr != self.primary_server {
-            self.ensure_connection(&addr).await?;
-        }
-        // Inlined rather than `connection_for_tree`, so `self.dfs_resolver`
-        // and the connection aren't borrowed from `self` at the same time.
-        let conn = if addr == self.primary_server {
-            &mut self.conn
-        } else {
-            &mut self
-                .extra_connections
-                .get_mut(&addr)
-                .ok_or(Error::Disconnected)?
-                .conn
-        };
+        self.ensure_connection(&addr).await?;
+        let conn = self.connections.for_addr(&addr)?;
         self.dfs_resolver.resolve(conn, path).await
     }
 
@@ -717,10 +690,9 @@ impl SmbClient {
             .get(host)
             .cloned()
             .unwrap_or_else(|| {
-                if host == self.primary_server
-                    || self.primary_server.starts_with(&format!("{host}:"))
-                {
-                    self.primary_server.clone()
+                let primary = self.connections.primary_server();
+                if host == primary || primary.starts_with(&format!("{host}:")) {
+                    primary.to_string()
                 } else {
                     format!("{host}:445")
                 }
@@ -753,21 +725,20 @@ impl SmbClient {
         // An explicit reconnect works even when `auto_reconnect` is off: the
         // caller is asking for exactly this, and everything needed to do it is
         // already in the config.
-        if !self.conn.can_reconnect() {
-            self.conn
-                .set_reviver(Some(std::sync::Arc::new(ClientReviver::from_config(
-                    &self.config,
-                ))));
+        let primary = self.connections.primary_mut();
+        if !primary.can_reconnect() {
+            primary.set_reviver(Some(std::sync::Arc::new(ClientReviver::from_config(
+                &self.config,
+            ))));
         }
         // Say so first: `reconnect_if_needed` is a no-op on a connection that
         // still looks alive, and a caller reaching for this has decided
         // otherwise.
-        self.conn.mark_dead();
-        self.conn.reconnect_if_needed().await?;
+        primary.mark_dead();
+        primary.reconnect_if_needed().await?;
         self.refresh_session();
 
-        self.primary_server = self.config.addr.clone();
-        self.extra_connections.clear();
+        self.connections.clear_extras();
 
         debug!(
             "smb_client: reconnected, new session_id={}",
@@ -778,19 +749,19 @@ impl SmbClient {
 
     /// Whether the connection is currently torn down.
     pub fn is_disconnected(&self) -> bool {
-        self.conn.is_disconnected()
+        self.connections.primary().is_disconnected()
     }
 
     /// Be told about every reconnect as it happens. See
     /// [`Connection::on_reconnect`].
     pub fn on_reconnect(&self, observer: Option<connection::ReconnectObserver>) {
-        self.conn.on_reconnect(observer);
+        self.connections.primary().on_reconnect(observer);
     }
 
     /// Replace the bounds on an automatic reconnect. See
     /// [`ReconnectPolicy`].
     pub fn set_reconnect_policy(&self, policy: connection::ReconnectPolicy) {
-        self.conn.set_reconnect_policy(policy);
+        self.connections.primary().set_reconnect_policy(policy);
     }
 
     /// Get the negotiated parameters, or `None` before NEGOTIATE has run.
@@ -799,7 +770,7 @@ impl SmbClient {
     /// connection is revived on a fresh socket. Every field is a scalar, so
     /// the copy costs nothing.
     pub fn params(&self) -> Option<NegotiatedParams> {
-        self.conn.params()
+        self.connections.primary().params()
     }
 
     /// Get the session info.
@@ -814,12 +785,12 @@ impl SmbClient {
 
     /// Current number of available credits.
     pub fn credits(&self) -> u16 {
-        self.conn.credits()
+        self.connections.primary().credits()
     }
 
     /// Estimated round-trip time from the negotiate exchange.
     pub fn estimated_rtt(&self) -> Option<Duration> {
-        self.conn.estimated_rtt()
+        self.connections.primary().estimated_rtt()
     }
 
     /// Capture a tree of diagnostics: client config, primary + DFS-extra
@@ -837,7 +808,7 @@ impl SmbClient {
 
         let (cache_hits, referrals_resolved) = self.dfs_resolver.counters();
         let client = ClientInfo {
-            primary_server: self.primary_server.clone(),
+            primary_server: self.connections.primary_server().to_string(),
             timeout: self.config.timeout,
             auto_reconnect: self.config.auto_reconnect,
             dfs_enabled: self.config.dfs_enabled,
@@ -855,12 +826,12 @@ impl SmbClient {
             signing_algorithm: s.signing_algorithm,
         };
 
-        let mut primary = self.conn.diagnostics();
+        let mut primary = self.connections.primary().diagnostics();
         primary.session = Some(session_for(&self.session));
 
         let extra_connections = self
-            .extra_connections
-            .values()
+            .connections
+            .extras()
             .map(|entry| {
                 let mut d = entry.conn.diagnostics();
                 d.session = Some(session_for(&entry.session));
@@ -885,7 +856,7 @@ impl SmbClient {
     /// DFS cross-server connections are separate; see
     /// [`diagnostics`](Self::diagnostics) for all of them.
     pub fn connection(&self) -> &Connection {
-        &self.conn
+        self.connections.primary()
     }
 
     /// Get a mutable reference to the underlying connection.
@@ -894,36 +865,7 @@ impl SmbClient {
     /// `&mut Connection`. For most use cases, prefer the convenience methods
     /// on `SmbClient` (like [`list_directory`](Self::list_directory)) instead.
     pub fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
-
-    /// Get a mutable reference to the connection that owns the given tree.
-    ///
-    /// Routes through the primary connection when the tree's server matches,
-    /// or through an extra connection established for a DFS cross-server
-    /// referral.
-    ///
-    /// ❌ **Not a panic.** A `Tree` outlives the pool entry it was resolved
-    /// on: [`reconnect`](Self::reconnect) drops every extra connection, and a
-    /// consumer reasonably still holds the DFS-resolved `Tree` it had. That
-    /// used to panic inside a library. `Error::Disconnected` is both true and
-    /// the classification whose documented response —
-    /// [`connect_share`](Self::connect_share) again — is exactly right here.
-    pub(crate) fn connection_for_tree(&mut self, tree: &Tree) -> Result<&mut Connection> {
-        if tree.server == self.primary_server {
-            return Ok(&mut self.conn);
-        }
-        match self.extra_connections.get_mut(&tree.server) {
-            Some(entry) => Ok(&mut entry.conn),
-            None => {
-                debug!(
-                    "smb_client: no connection for {} (share {:?}); the DFS target it was \
-                     resolved on is gone, so connect_share again",
-                    tree.server, tree.share_name
-                );
-                Err(Error::Disconnected)
-            }
-        }
+        self.connections.primary_mut()
     }
 
     // ── DFS helpers ───────────────────────────────────────────────────
@@ -951,18 +893,7 @@ impl SmbClient {
         debug!("dfs: resolving {}", unc_path);
 
         // Resolve the referral (uses cache or IOCTL).
-        // We inline the connection lookup to avoid borrowing both
-        // `self.dfs_resolver` and `self` (via connection_for_tree)
-        // at the same time.
-        let conn = if tree.server == self.primary_server {
-            &mut self.conn
-        } else {
-            &mut self
-                .extra_connections
-                .get_mut(&tree.server)
-                .expect("no connection for tree server")
-                .conn
-        };
+        let conn = self.connections.for_tree(tree)?;
         let resolved_list = self.dfs_resolver.resolve(conn, &unc_path).await?;
 
         // Try each target (multi-target failover).
@@ -1013,10 +944,10 @@ impl SmbClient {
 
     /// Ensure a connection exists in the pool for the given server address.
     async fn ensure_connection(&mut self, target_addr: &str) -> Result<()> {
-        if target_addr == self.primary_server {
+        if self.connections.is_primary(target_addr) {
             return Ok(()); // Already have primary connection.
         }
-        if self.extra_connections.contains_key(target_addr) {
+        if self.connections.extra(target_addr).is_some() {
             return Ok(()); // Already in pool.
         }
 
@@ -1047,9 +978,9 @@ impl SmbClient {
         }
         // And it inherits the bounds the consumer set on the primary, rather
         // than silently falling back to the defaults.
-        conn.set_reconnect_policy(self.conn.reconnect_policy());
+        conn.set_reconnect_policy(self.connections.primary().reconnect_policy());
 
-        self.extra_connections.insert(
+        self.connections.insert_extra(
             target_addr.to_string(),
             ConnectionEntry {
                 conn,
@@ -1061,24 +992,24 @@ impl SmbClient {
 
     /// Ensure a tree-connect exists for the given server and share.
     async fn ensure_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
-        // `tree.server` is the full addr:port, so `connection_for_tree` can
+        // `tree.server` is the full addr:port, so `Connections::for_tree` can
         // tell apart targets sharing a hostname on different ports (Docker
         // port-mapped containers, for one).
         //
         // Two branches rather than one, because the primary connection's
         // session lives beside it on `self` while an extra connection carries
         // its own, authenticated separately.
-        if target_addr == self.primary_server {
+        if self.connections.is_primary(target_addr) {
             self.refresh_session();
-            let mut tree = Tree::connect(&mut self.conn, share).await?;
+            let mut tree = Tree::connect(self.connections.primary_mut(), share).await?;
             tree.server = target_addr.to_string();
-            activate_share_encryption(&mut self.conn, &self.session, &tree);
+            activate_share_encryption(self.connections.primary_mut(), &self.session, &tree);
             return Ok(tree);
         }
 
         let entry = self
-            .extra_connections
-            .get_mut(target_addr)
+            .connections
+            .extra_mut(target_addr)
             .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?;
         let mut tree = Tree::connect(&mut entry.conn, share).await?;
         tree.server = target_addr.to_string();
@@ -1109,18 +1040,9 @@ impl SmbClient {
         self.config.auto_reconnect
             && matches!(err, Error::Disconnected | Error::ServerUnresponsive { .. })
             && self
-                .connection_for_tree_ref(tree)
-                .is_some_and(|conn| conn.can_reconnect())
-    }
-
-    /// The connection that owns `tree`, or `None` when this client has none
-    /// for it.
-    fn connection_for_tree_ref(&self, tree: &Tree) -> Option<&Connection> {
-        if tree.server == self.primary_server {
-            Some(&self.conn)
-        } else {
-            self.extra_connections.get(&tree.server).map(|e| &e.conn)
-        }
+                .connections
+                .for_tree_ref(tree)
+                .is_ok_and(|conn| conn.can_reconnect())
     }
 
     /// Bring the tree's own connection back and re-establish `tree` on the new
@@ -1134,8 +1056,8 @@ impl SmbClient {
     async fn recover_tree(&mut self, tree: &mut Tree) -> Result<()> {
         let share = tree.share_name.clone();
 
-        if tree.server == self.primary_server {
-            self.conn.reconnect_if_needed().await?;
+        if self.connections.is_primary(&tree.server) {
+            self.connections.primary_mut().reconnect_if_needed().await?;
             self.refresh_session();
             // In place, exactly as the DFS redirect does: the caller keeps
             // using the `&mut Tree` it passed in, now pointing at the new
@@ -1146,8 +1068,8 @@ impl SmbClient {
 
         let addr = tree.server.clone();
         let entry = self
-            .extra_connections
-            .get_mut(&addr)
+            .connections
+            .extra_mut(&addr)
             .ok_or(Error::Disconnected)?;
         entry.conn.reconnect_if_needed().await?;
         // Adopt whatever session the revival established. ❌ Skipping this is
@@ -1174,18 +1096,18 @@ impl SmbClient {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.list_directory(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.list_directory(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.list_directory(conn, path).await
             }
             other => other,
@@ -1195,18 +1117,18 @@ impl SmbClient {
     /// Read a file from the given share.
     pub async fn read_file(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.read_file(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file(conn, path).await
             }
             other => other,
@@ -1220,18 +1142,18 @@ impl SmbClient {
     /// READ (up to MaxReadSize, typically 8 MB).
     pub async fn read_file_compound(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.read_file_compound(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file_compound(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file_compound(conn, path).await
             }
             other => other,
@@ -1241,18 +1163,18 @@ impl SmbClient {
     /// Read a file using pipelined I/O (faster for large files).
     pub async fn read_file_pipelined(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.read_file_pipelined(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file_pipelined(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.read_file_pipelined(conn, path).await
             }
             other => other,
@@ -1262,13 +1184,13 @@ impl SmbClient {
     /// Write data to a file on the given share (create or overwrite).
     pub async fn write_file(&mut self, tree: &mut Tree, path: &str, data: &[u8]) -> Result<u64> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.write_file(conn, path, data).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.write_file(conn, &new_path, data).await
             }
             other => other,
@@ -1288,13 +1210,13 @@ impl SmbClient {
         data: &[u8],
     ) -> Result<u64> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.write_file_compound(conn, path, data).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.write_file_compound(conn, &new_path, data).await
             }
             other => other,
@@ -1314,13 +1236,13 @@ impl SmbClient {
         data: &[u8],
     ) -> Result<u64> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.write_file_compound_exclusive(conn, path, data).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.write_file_compound_exclusive(conn, &new_path, data)
                     .await
             }
@@ -1336,13 +1258,13 @@ impl SmbClient {
         data: &[u8],
     ) -> Result<u64> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.write_file_pipelined(conn, path, data).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.write_file_pipelined(conn, &new_path, data).await
             }
             other => other,
@@ -1355,7 +1277,7 @@ impl SmbClient {
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&mut self, tree: &mut Tree) -> Result<tree::FsInfo> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.fs_info(conn).await
         };
         match result {
@@ -1363,12 +1285,12 @@ impl SmbClient {
                 // fs_info has no path argument -- the DFS redirect uses
                 // the root of the share as the path.
                 let _new_path = self.handle_dfs_redirect(tree, "").await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.fs_info(conn).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.fs_info(conn).await
             }
             other => other,
@@ -1378,13 +1300,13 @@ impl SmbClient {
     /// Delete a file on the given share.
     pub async fn delete_file(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.delete_file(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.delete_file(conn, &new_path).await
             }
             other => other,
@@ -1403,7 +1325,7 @@ impl SmbClient {
     /// is a DFS target, perform a single-file operation first to trigger
     /// the redirect, then use the batch method on the resolved tree.
     pub async fn delete_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<()>> {
-        let conn = match self.connection_for_tree(tree) {
+        let conn = match self.connections.for_tree(tree) {
             Ok(conn) => conn,
             Err(_) => return no_connection_results(paths.len()),
         };
@@ -1413,18 +1335,18 @@ impl SmbClient {
     /// Get file metadata (size, timestamps, whether it's a directory).
     pub async fn stat(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.stat(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.stat(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.stat(conn, path).await
             }
             other => other,
@@ -1442,18 +1364,18 @@ impl SmbClient {
     #[doc(alias = "realpath")]
     pub async fn resolve(&mut self, tree: &mut Tree, path: &str) -> Result<resolve::Resolved> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.resolve(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.resolve(conn, &new_path).await
             }
             Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.resolve(conn, path).await
             }
             other => other,
@@ -1473,7 +1395,7 @@ impl SmbClient {
     /// is a DFS target, perform a single-file operation first to trigger
     /// the redirect, then use the batch method on the resolved tree.
     pub async fn stat_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
-        let conn = match self.connection_for_tree(tree) {
+        let conn = match self.connections.for_tree(tree) {
             Ok(conn) => conn,
             Err(_) => return no_connection_results(paths.len()),
         };
@@ -1483,13 +1405,13 @@ impl SmbClient {
     /// Rename a file or directory on the given share.
     pub async fn rename(&mut self, tree: &mut Tree, from: &str, to: &str) -> Result<()> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.rename(conn, from, to).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, from).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.rename(conn, &new_path, to).await
             }
             other => other,
@@ -1512,7 +1434,7 @@ impl SmbClient {
         tree: &mut Tree,
         renames: &[(&str, &str)],
     ) -> Vec<Result<()>> {
-        let conn = match self.connection_for_tree(tree) {
+        let conn = match self.connections.for_tree(tree) {
             Ok(conn) => conn,
             Err(_) => return no_connection_results(renames.len()),
         };
@@ -1522,13 +1444,13 @@ impl SmbClient {
     /// Create a directory on the given share.
     pub async fn create_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.create_directory(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.create_directory(conn, &new_path).await
             }
             other => other,
@@ -1538,13 +1460,13 @@ impl SmbClient {
     /// Delete an empty directory on the given share.
     pub async fn delete_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
         let result = {
-            let conn = self.connection_for_tree(tree)?;
+            let conn = self.connections.for_tree(tree)?;
             tree.delete_directory(conn, path).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
-                let conn = self.connection_for_tree(tree)?;
+                let conn = self.connections.for_tree(tree)?;
                 tree.delete_directory(conn, &new_path).await
             }
             other => other,
@@ -1584,7 +1506,7 @@ impl SmbClient {
         tree: &'a Tree,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        tree.download(&mut self.conn, path).await
+        tree.download(self.connections.for_tree(tree)?, path).await
     }
 
     /// Start a streaming file upload with progress tracking.
@@ -1624,27 +1546,23 @@ impl SmbClient {
         path: &str,
         data: &'a [u8],
     ) -> Result<stream::FileUpload<'a>> {
-        let max_write = self
-            .conn
+        let conn = self.connections.for_tree(tree)?;
+        let max_write = conn
             .params()
             .map(|p| p.max_write_size as usize)
             .unwrap_or(65536);
 
-        if data.len() as u64 <= self.conn.compound_write_limit() {
+        if data.len() as u64 <= conn.compound_write_limit() {
             // Small file: write everything via compound in one round-trip.
             // The limit is `max_write`, lowered to what the credit window funds.
-            tree.write_file_compound(&mut self.conn, path, data).await?;
-            Ok(stream::FileUpload::new_done(
-                tree,
-                &mut self.conn,
-                data.len() as u64,
-            ))
+            tree.write_file_compound(conn, path, data).await?;
+            Ok(stream::FileUpload::new_done(tree, conn, data.len() as u64))
         } else {
             // Large file: open the file, let the caller drive chunks.
-            let file_id = tree.open_file_for_write(&mut self.conn, path).await?;
+            let file_id = tree.open_file_for_write(conn, path).await?;
             Ok(stream::FileUpload::new(
                 tree,
-                &mut self.conn,
+                conn,
                 file_id,
                 data,
                 max_write as u32,
@@ -1655,7 +1573,7 @@ impl SmbClient {
     /// Open a random-access [`FileReader`](stream::FileReader) over a file on
     /// the share.
     ///
-    /// Clones the client's primary connection (cheap `Arc::clone`) and the
+    /// Clones the tree's connection (cheap `Arc::clone`) and the
     /// `Tree`, then returns a reader that serves any number of positioned reads
     /// at arbitrary offsets over one open handle. The returned reader is
     /// `'static` and does not borrow the client, so concurrent readers proceed
@@ -1664,7 +1582,8 @@ impl SmbClient {
     ///
     /// No DFS retry; the reader pins to the connection it was built from.
     pub async fn open_file_reader(&self, tree: &Tree, path: &str) -> Result<stream::FileReader> {
-        stream::open_file_reader(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
+        let conn = self.connections.for_tree_ref(tree)?.clone();
+        stream::open_file_reader(std::sync::Arc::new(tree.clone()), conn, path).await
     }
 
     /// Create a push-based pipelined streaming file writer.
@@ -1690,11 +1609,12 @@ impl SmbClient {
     /// # }
     /// ```
     pub async fn create_file_writer(&self, tree: &Tree, path: &str) -> Result<stream::FileWriter> {
-        // Convenience wrapper: clone the primary connection (cheap
+        // Convenience wrapper: clone the tree's connection (cheap
         // `Arc::clone`) and the `Tree` into an `Arc`, then build a writer
         // that owns both. The client's connection is not borrowed for the
         // upload's duration, so concurrent writers proceed in parallel.
-        stream::open_file_writer(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
+        let conn = self.connections.for_tree_ref(tree)?.clone();
+        stream::open_file_writer(std::sync::Arc::new(tree.clone()), conn, path).await
     }
 
     /// Exclusive-create sibling of [`create_file_writer`](Self::create_file_writer).
@@ -1710,12 +1630,8 @@ impl SmbClient {
         tree: &Tree,
         path: &str,
     ) -> Result<stream::FileWriter> {
-        stream::open_file_writer_exclusive(
-            std::sync::Arc::new(tree.clone()),
-            self.conn.clone(),
-            path,
-        )
-        .await
+        let conn = self.connections.for_tree_ref(tree)?.clone();
+        stream::open_file_writer_exclusive(std::sync::Arc::new(tree.clone()), conn, path).await
     }
 
     /// Create a positioned push-based streaming file writer.
@@ -1733,13 +1649,8 @@ impl SmbClient {
         path: &str,
         offset: u64,
     ) -> Result<stream::FileWriter> {
-        stream::open_file_writer_at(
-            std::sync::Arc::new(tree.clone()),
-            self.conn.clone(),
-            path,
-            offset,
-        )
-        .await
+        let conn = self.connections.for_tree_ref(tree)?.clone();
+        stream::open_file_writer_at(std::sync::Arc::new(tree.clone()), conn, path, offset).await
     }
 
     /// Read a file with progress reporting and cancellation.
@@ -1759,7 +1670,7 @@ impl SmbClient {
         // callback is consumed by the first attempt). For now, attempt
         // the operation directly. If DFS redirect is needed, the caller
         // should resolve the tree first using a simpler method.
-        let conn = self.connection_for_tree(tree)?;
+        let conn = self.connections.for_tree(tree)?;
         tree.read_file_pipelined_with_progress(conn, path, on_progress)
             .await
     }
@@ -1781,6 +1692,8 @@ impl SmbClient {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        let conn = self.connections.for_tree(tree)?;
+
         // Open the file for writing.
         let req = crate::msg::create::CreateRequest {
             requested_oplock_level: crate::types::OplockLevel::None,
@@ -1798,8 +1711,7 @@ impl SmbClient {
             create_contexts: vec![],
         };
 
-        let frame = self
-            .conn
+        let frame = conn
             .execute(crate::types::Command::Create, &req, Some(tree.tree_id))
             .await?;
 
@@ -1814,13 +1726,8 @@ impl SmbClient {
         let create_resp = crate::msg::create::CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
-        let max_write = self
-            .conn
-            .params()
-            .map(|p| p.max_write_size)
-            .unwrap_or(65536);
-        let mut pipe =
-            write_pipe::WritePipe::new(self.conn.clone(), tree.tree_id, file_id, max_write);
+        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+        let mut pipe = write_pipe::WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write);
         let total_bytes = Some(data.len() as u64);
 
         // Reported whenever the server has confirmed more, which is what
@@ -1862,7 +1769,7 @@ impl SmbClient {
                 // Cancelled: wait out what's on the wire, then close without
                 // a flush (best-effort).
                 pipe.abandon().await;
-                let _ = tree.close_handle(&mut self.conn, file_id).await;
+                let _ = tree.close_handle(conn, file_id).await;
                 return Err(crate::Error::Cancelled);
             }
             Err(e) => {
@@ -1873,17 +1780,17 @@ impl SmbClient {
                         ..
                     }
                 ) {
-                    let _ = tree.close_handle(&mut self.conn, file_id).await;
+                    let _ = tree.close_handle(conn, file_id).await;
                 }
                 return Err(e);
             }
         };
 
         // Flush to ensure data is persisted.
-        tree.flush_handle(&mut self.conn, file_id).await?;
+        tree.flush_handle(conn, file_id).await?;
 
         // Close the handle.
-        tree.close_handle(&mut self.conn, file_id).await?;
+        tree.close_handle(conn, file_id).await?;
 
         Ok(total_written)
     }
@@ -1906,7 +1813,7 @@ impl SmbClient {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
-        let conn = self.connection_for_tree(tree)?;
+        let conn = self.connections.for_tree(tree)?;
         tree.write_file_streamed(conn, path, next_chunk).await
     }
 
@@ -1918,7 +1825,7 @@ impl SmbClient {
     /// Use this if you need to flush a handle obtained through the
     /// low-level API.
     pub async fn flush_file(&mut self, tree: &mut Tree, file_id: FileId) -> Result<()> {
-        let conn = self.connection_for_tree(tree)?;
+        let conn = self.connections.for_tree(tree)?;
         tree.flush_handle(conn, file_id).await
     }
 
@@ -1933,12 +1840,13 @@ impl SmbClient {
     /// all clones multiplex over the same SMB session), so this client
     /// remains usable for other operations while watching.
     pub async fn watch(&mut self, tree: &Tree, path: &str, recursive: bool) -> Result<Watcher> {
-        tree.watch(&mut self.conn, path, recursive).await
+        tree.watch(self.connections.for_tree(tree)?, path, recursive)
+            .await
     }
 
     /// Disconnect from a share.
     pub async fn disconnect_share(&mut self, tree: &Tree) -> Result<()> {
-        let conn = self.connection_for_tree(tree)?;
+        let conn = self.connections.for_tree(tree)?;
         tree.disconnect(conn).await
     }
 }
@@ -2161,7 +2069,7 @@ mod tests {
     /// server does.
     fn pool_extra_connection(client: &mut SmbClient, addr: &str, mock: &Arc<MockTransport>) {
         let conn = crate::client::test_helpers::setup_connection(mock);
-        client.extra_connections.insert(
+        client.connections.insert_extra(
             addr.to_string(),
             ConnectionEntry {
                 conn,
@@ -2192,7 +2100,8 @@ mod tests {
         client.config.auto_reconnect = true;
         // The primary is armed; the DFS target is not.
         client
-            .conn
+            .connections
+            .primary()
             .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x1)))));
 
         let target_mock = Arc::new(MockTransport::new());
@@ -2205,7 +2114,10 @@ mod tests {
         );
 
         // Arm the target, and it becomes recoverable.
-        client.extra_connections["dfs-target:445"]
+        client
+            .connections
+            .extra("dfs-target:445")
+            .unwrap()
             .conn
             .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2)))));
         assert!(client.session_is_gone(&target_tree, &Error::Disconnected));
@@ -2214,6 +2126,122 @@ mod tests {
         // "recoverable", whatever the primary says.
         let stranger = a_dfs_target_tree("somewhere-else:445", "secret");
         assert!(!client.session_is_gone(&stranger, &Error::Disconnected));
+    }
+
+    /// Every `SmbClient` method that takes a `Tree` and hands back a handle or
+    /// drives the transfer itself, one variant each. The rest go through the
+    /// DFS retry wrappers and are covered by the same lookup.
+    #[derive(Debug, Clone, Copy)]
+    enum TreeCall {
+        Download,
+        UploadSmall,
+        UploadLarge,
+        Watch,
+        OpenFileReader,
+        CreateFileWriter,
+        CreateFileWriterExclusive,
+        CreateFileWriterAt,
+        WriteFileWithProgress,
+    }
+
+    impl TreeCall {
+        const ALL: [TreeCall; 9] = [
+            TreeCall::Download,
+            TreeCall::UploadSmall,
+            TreeCall::UploadLarge,
+            TreeCall::Watch,
+            TreeCall::OpenFileReader,
+            TreeCall::CreateFileWriter,
+            TreeCall::CreateFileWriterExclusive,
+            TreeCall::CreateFileWriterAt,
+            TreeCall::WriteFileWithProgress,
+        ];
+
+        /// Send the call's first request. Nothing answers it: only where it
+        /// went matters, so the caller abandons the call after a moment.
+        async fn start(self, client: &mut SmbClient, tree: &mut Tree) -> Result<()> {
+            // Past the compound write limit, so the upload opens a handle.
+            let large = vec![0u8; 200_000];
+            match self {
+                TreeCall::Download => client.download(tree, "f.bin").await.map(drop),
+                TreeCall::UploadSmall => client.upload(tree, "f.bin", b"hi").await.map(drop),
+                TreeCall::UploadLarge => client.upload(tree, "f.bin", &large).await.map(drop),
+                TreeCall::Watch => client.watch(tree, "", false).await.map(drop),
+                TreeCall::OpenFileReader => client.open_file_reader(tree, "f.bin").await.map(drop),
+                TreeCall::CreateFileWriter => {
+                    client.create_file_writer(tree, "f.bin").await.map(drop)
+                }
+                TreeCall::CreateFileWriterExclusive => client
+                    .create_file_writer_exclusive(tree, "f.bin")
+                    .await
+                    .map(drop),
+                TreeCall::CreateFileWriterAt => client
+                    .create_file_writer_at(tree, "f.bin", 10)
+                    .await
+                    .map(drop),
+                TreeCall::WriteFileWithProgress => client
+                    .write_file_with_progress(tree, "f.bin", b"hi", |_| ControlFlow::Continue(()))
+                    .await
+                    .map(drop),
+            }
+        }
+    }
+
+    /// A DFS-target tree's `TreeId` only means something to the session that
+    /// issued it. Sent to the primary, it either fails with
+    /// `STATUS_NETWORK_NAME_DELETED` or, when the ids collide, reads or writes
+    /// a same-named file on a different share. So nothing may go out on the
+    /// primary, and the request must go out on the target's own connection.
+    #[tokio::test(start_paused = true)]
+    async fn every_tree_call_goes_out_on_the_trees_own_connection() {
+        let mut misrouted = Vec::new();
+        for call in TreeCall::ALL {
+            let primary = Arc::new(MockTransport::new());
+            let mut client = make_mock_client(&primary, SessionId(0x77)).await;
+            let target = Arc::new(MockTransport::new());
+            pool_extra_connection(&mut client, "dfs-target:445", &target);
+            let sent_on_primary = primary.sent_count();
+
+            let mut tree = a_dfs_target_tree("dfs-target:445", "projects");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(1), call.start(&mut client, &mut tree))
+                    .await;
+
+            if primary.sent_count() != sent_on_primary || target.sent_count() == 0 {
+                misrouted.push(call);
+            }
+        }
+        assert!(
+            misrouted.is_empty(),
+            "sent the target's tree over the primary connection: {misrouted:?}"
+        );
+    }
+
+    /// A tree whose DFS connection is gone is refused before anything is sent,
+    /// by the handle openers too, which have no `&mut self` to route with.
+    #[tokio::test(start_paused = true)]
+    async fn every_tree_call_on_an_orphaned_tree_says_disconnected() {
+        let mut wrong = Vec::new();
+        for call in TreeCall::ALL {
+            let primary = Arc::new(MockTransport::new());
+            let mut client = make_mock_client(&primary, SessionId(0x77)).await;
+            let sent_on_primary = primary.sent_count();
+
+            let mut orphan = a_dfs_target_tree("dfs-target:445", "projects");
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(1), call.start(&mut client, &mut orphan))
+                    .await;
+
+            if !matches!(outcome, Ok(Err(Error::Disconnected)))
+                || primary.sent_count() != sent_on_primary
+            {
+                wrong.push(call);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "not refused as Disconnected before sending: {wrong:?}"
+        );
     }
 
     // ── DFS namespace roots ───────────────────────────────────────────
@@ -2582,18 +2610,21 @@ mod tests {
     async fn a_server_without_cap_dfs_is_never_asked_for_a_referral() {
         let mock = Arc::new(MockTransport::new());
         let mut client = make_mock_client(&mock, SessionId(0x77)).await;
-        client.conn.set_test_params(NegotiatedParams {
-            dialect: Dialect::Smb3_1_1,
-            max_read_size: 65536,
-            max_write_size: 65536,
-            max_transact_size: 65536,
-            server_guid: Guid::ZERO,
-            signing_required: false,
-            capabilities: Capabilities::default(), // no DFS
-            gmac_negotiated: false,
-            cipher: None,
-            compression_supported: false,
-        });
+        client
+            .connections
+            .primary_mut()
+            .set_test_params(NegotiatedParams {
+                dialect: Dialect::Smb3_1_1,
+                max_read_size: 65536,
+                max_write_size: 65536,
+                max_transact_size: 65536,
+                server_guid: Guid::ZERO,
+                signing_required: false,
+                capabilities: Capabilities::default(), // no DFS
+                gmac_negotiated: false,
+                cipher: None,
+                compression_supported: false,
+            });
 
         mock.queue_response(build_tree_connect_refusal(
             NtStatus::BAD_NETWORK_NAME,
@@ -2692,7 +2723,7 @@ mod tests {
 
         let orphan = a_dfs_target_tree("dfs-target:445", "secret");
         assert!(matches!(
-            client.connection_for_tree(&orphan),
+            client.connections.for_tree(&orphan),
             Err(Error::Disconnected)
         ));
 
@@ -2723,8 +2754,8 @@ mod tests {
         ));
 
         let entry = client
-            .extra_connections
-            .get_mut("dfs-target:445")
+            .connections
+            .extra_mut("dfs-target:445")
             .expect("just pooled");
         entry.conn.set_reviver(Some(
             Arc::clone(&reviver) as Arc<dyn connection::SessionReviver>
@@ -2743,7 +2774,10 @@ mod tests {
             "tree re-established on the new session"
         );
         assert_eq!(tree.server, "dfs-target:445", "still routed to the target");
-        assert!(!client.extra_connections["dfs-target:445"]
+        assert!(!client
+            .connections
+            .extra("dfs-target:445")
+            .unwrap()
             .conn
             .is_disconnected());
         // The primary was not touched.
@@ -2772,7 +2806,10 @@ mod tests {
 
         assert!(tree.encrypt_data);
         assert!(
-            client.extra_connections["dfs-target:445"]
+            client
+                .connections
+                .extra("dfs-target:445")
+                .unwrap()
                 .conn
                 .should_encrypt(),
             "a DFS target share flagged SMB2_SHAREFLAG_ENCRYPT_DATA must be encrypted"
@@ -2792,7 +2829,10 @@ mod tests {
         target_mock.queue_response(build_tree_connect_response(TreeId(5), ShareType::Disk));
         client.ensure_tree("dfs-target:445", "plain").await.unwrap();
 
-        assert!(!client.extra_connections["dfs-target:445"]
+        assert!(!client
+            .connections
+            .extra("dfs-target:445")
+            .unwrap()
             .conn
             .should_encrypt());
     }
@@ -2926,7 +2966,10 @@ mod tests {
         assert_eq!(client.session().session_id, original_session_id);
 
         let reviver = Arc::new(MockReviver::new(SessionId(0x2222)));
-        client.conn.set_reviver(Some(reviver.clone()));
+        client
+            .connections
+            .primary()
+            .set_reviver(Some(reviver.clone()));
         client.reconnect().await.unwrap();
 
         assert_eq!(
@@ -2950,11 +2993,12 @@ mod tests {
     async fn a_connection_clone_taken_before_a_reconnect_is_alive_after_it() {
         let mock = Arc::new(MockTransport::new());
         let mut client = make_mock_client(&mock, SessionId(0x1111)).await;
-        let held = client.conn.clone();
+        let held = client.connections.primary().clone();
         assert_eq!(held.generation(), 0);
 
         client
-            .conn
+            .connections
+            .primary()
             .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2222)))));
         client.reconnect().await.unwrap();
 
@@ -2974,7 +3018,8 @@ mod tests {
         let old_server_guid = client.params().unwrap().server_guid;
 
         client
-            .conn
+            .connections
+            .primary()
             .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2222)))));
         client.reconnect().await.unwrap();
 
@@ -3046,8 +3091,8 @@ mod tests {
         let tree = client.connect_share("TestShare").await.unwrap();
 
         client.config.auto_reconnect = true;
-        client.conn.set_reviver(Some(reviver));
-        client.conn.mark_dead(); // the NAS went away
+        client.connections.primary().set_reviver(Some(reviver));
+        client.connections.primary().mark_dead(); // the NAS went away
         (client, tree)
     }
 
@@ -3134,7 +3179,7 @@ mod tests {
         let client = make_mock_client(&mock, SessionId(1)).await;
         assert!(!client.config().auto_reconnect);
         assert!(
-            !client.conn.can_reconnect(),
+            !client.connections.primary().can_reconnect(),
             "nothing should dial on a consumer's behalf without being asked"
         );
     }

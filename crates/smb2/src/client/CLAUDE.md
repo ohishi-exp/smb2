@@ -7,6 +7,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | File | Purpose |
 |---|---|
 | `mod.rs` | `SmbClient`, `ClientConfig`, `connect()` shorthand |
+| `connections.rs` | `Connections` -- the primary connection plus the DFS pool, and `for_tree`, the one lookup from a `Tree` to its connection |
 | `connection.rs` | `Connection` -- message sequencing, response deadline, signing, encryption, `execute` / `execute_compound` |
 | `credits.rs` | `CreditPool` -- the connection-wide credit budget and the send-side gate |
 | `session.rs` | `Session::setup()` -- NTLM auth, key derivation, signing/encryption activation |
@@ -31,15 +32,15 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 ## Layering
 
 ```
-SmbClient  (owns Connection + Session, stores credentials for reconnect)
+SmbClient  (owns Connections + Session, stores credentials for reconnect)
   Connection  (TCP transport, credits, message IDs, signing, encryption)
     Session   (NTLM auth, key derivation -- setup mutates Connection)
       Tree    (share-level ops, borrows &mut Connection for each call)
-  extra_connections  (HashMap<String, ConnectionEntry> for DFS cross-server)
+  Connections  (primary Connection + HashMap<String, ConnectionEntry> for DFS cross-server)
   dfs_resolver       (DfsResolver with TTL-based referral cache)
 ```
 
-All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenience methods use `connection_for_tree(tree)` to route through the correct connection (primary or DFS extra connection) based on the tree's `server` field.
+All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` methods reach a tree's connection only through `Connections::for_tree` / `for_tree_ref` (primary or DFS extra connection, by the tree's `server` field); the primary alone takes an explicit `primary_mut()`, for calls with no tree. See § DFS.
 
 ## Connection and credits
 
@@ -265,6 +266,11 @@ with the resolved remaining path.
   reports when a server asked for it.
 
 **Key design decisions:**
+- ❌ **Every call that takes a `Tree` goes through the tree's own connection** (`Connections::for_tree`, or
+  `for_tree_ref` + `clone()` for a `&self` handle opener), never `primary_mut()`. A DFS target's `TreeId` means nothing
+  to the primary's session: it fails with `STATUS_NETWORK_NAME_DELETED`, or, when the small per-session ids collide,
+  reads or writes a same-named file on a different share. The primary is private to `Connections` so this can't happen
+  by reaching for a field; `every_tree_call_goes_out_on_the_trees_own_connection` pins the handle and streaming calls.
 - **A pool of extra connections, keyed by `host:port`**, never replacing the primary: replacing it would invalidate
   every `Tree` the caller already holds.
 - **The DFS header flag follows the tree** (`Connection::register_dfs_tree`), so no call site threads an `is_dfs`
@@ -277,7 +283,7 @@ with the resolved remaining path.
 - `watch` returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
 - Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
-- Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` and `root_referral` to avoid double `&mut self` borrows
+- `Connections` is its own field, so `handle_dfs_redirect` and `root_referral` borrow it beside `dfs_resolver` without inlining the lookup
 
 ## Watcher pipelining
 
@@ -297,11 +303,11 @@ For large files, `read_file_pipelined` issues multiple `execute_with_credits` ca
 
 `FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` — no lifetime parameter, no borrow against the `SmbClient` that built it. It buffers pushed bytes and hands them to its `WritePipe` one WRITE at a time; `finish` / `abort` drain the pipe, then FLUSH (finish only) and CLOSE.
 
-FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, and waiting for the window to have room is the backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the client's primary connection internally for convenience.
+FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, and waiting for the window to have room is the backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the tree's own connection internally for convenience.
 
 ## Random-access reads (`FileReader`)
 
-`FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the primary connection).
+`FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the tree's own connection).
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
 
@@ -334,7 +340,7 @@ measurements: `resolve.rs` module docs.
 
 ## Server-side copy (`copy.rs`)
 
-`FSCTL_SRV_COPYCHUNK` copies byte ranges between two files *on the server* — the data never crosses the wire. Two tiers, both on `Tree` (with `SmbClient` wrappers that route via `connection_for_tree`):
+`FSCTL_SRV_COPYCHUNK` copies byte ranges between two files *on the server* — the data never crosses the wire. Two tiers, both on `Tree` (with `SmbClient` wrappers that route via `Connections::for_tree`):
 
 - **Convenience**: `server_side_copy_file` (whole file, truncating dest) and `server_side_copy_file_range` (a range at a chosen dest offset, non-truncating dest). Both open source (read) + dest (read+write), get a resume key, batch the copy, flush+close both, and never leak a handle on an error path (shared `copy_paths` helper).
 - **Primitives**: `request_resume_key` (source handle → opaque `ResumeKey`), `copy_chunks` (one IOCTL against an open read+write dest), and `server_side_copy_range` (batches over open handles). These take caller-held `FileId`s like `open_file` does; `open_file_readwrite` opens a dest and `close_handle` (now public) releases it.
@@ -516,6 +522,6 @@ Decisions behind this shape (cited by ID from code, like decision E3), and what 
 - **FileWriter can leak handles on drop**: Same as FileDownload/FileUpload. Rust has no async drop. If not consumed via `finish()` or `abort()`, the file handle leaks. The type logs a debug warning.
 - **DFS paths must include server\share prefix**: When `SMB2_FLAGS_DFS_OPERATIONS` is set, the server expects the path to start with `server\share\` (MS-SMB2 3.2.4.3). `Tree::format_path()` handles this automatically for DFS shares. Without the prefix, Samba strips the first two path components, leading to wrong file opens.
 - **DFS redirect changes the tree in-place**: After a DFS redirect, `tree.server`, `tree.share_name`, and `tree.tree_id` all change. Subsequent operations on the same tree use the target server directly -- they must use target-relative paths, not the original DFS paths.
-- **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `connection_for_tree` can distinguish servers that share the same hostname but use different ports.
+- **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `Connections::for_tree` can distinguish servers that share the same hostname but use different ports.
 - **Every write that creates a file comes in a replacing and an exclusive form**: `write_file_compound` / `create_file_writer` use `FileOverwriteIf` (create or replace); `write_file_compound_exclusive` / `create_file_writer_exclusive` use `FileCreate`, which the server refuses atomically with `STATUS_OBJECT_NAME_COLLISION` (`ErrorKind::AlreadyExists`, an `Error::Protocol` naming the CREATE) if the name exists. A consumer that checked a name was free and then writes must use the exclusive form: the replacing one silently overwrites a file another writer put there in between. The disposition stays private (`*_with_disposition`), so the public surface is exactly these pairs.
 - **Servers MAY split compound responses**: MS-SMB2 section 3.3.4.1.3 says the server SHOULD compound responses but is not required to. Samba (and QNAP firmware built on it) is known to split compound chains into separate frames in some scenarios; Windows Server does too under certain conditions. The receiver task routes each sub-response by its `MessageId`, so `execute_compound` reassembles a split chain in submission order and no caller sees the difference (§ Receiving compound responses). Nothing counts or logs a split.

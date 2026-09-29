@@ -5509,6 +5509,93 @@ async fn dfs_namespace_root_falls_through_to_a_live_target() {
     );
 }
 
+/// A namespace root's tree lives on the target's connection, and the
+/// streaming, handle, and watch calls have to go there too. Sent over the
+/// namespace server's connection instead, the target session's tree id means
+/// nothing (`STATUS_NETWORK_NAME_DELETED`), or, when the ids collide, names a
+/// different share.
+#[tokio::test]
+#[ignore]
+async fn dfs_namespace_root_streams_writes_and_watches_on_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    let mut tree = client
+        .connect_share("projects")
+        .await
+        .expect("connect_share");
+    assert_eq!(tree.server, DFS_TARGET_ADDR, "the tree is on the target");
+
+    {
+        let mut download = client
+            .download(&tree, "hello.txt")
+            .await
+            .expect("download through the namespace root");
+        let mut received = Vec::new();
+        while let Some(chunk) = download.next_chunk().await {
+            received.extend_from_slice(&chunk.expect("next_chunk failed"));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&received).trim(),
+            "Hello from DFS target!"
+        );
+    }
+
+    let dir = "_test_dfs_namespace_streams";
+    let _ = client.create_directory(&mut tree, dir).await;
+
+    let written = format!("{dir}/written.tmp");
+    let mut writer = client
+        .create_file_writer(&tree, &written)
+        .await
+        .expect("create_file_writer through the namespace root");
+    writer
+        .write_chunk(b"written through the namespace")
+        .await
+        .expect("write_chunk");
+    writer.finish().await.expect("finish");
+    let back = client
+        .read_file(&mut tree, &written)
+        .await
+        .expect("read back what the writer wrote");
+    assert_eq!(back, b"written through the namespace");
+
+    let mut watcher = client
+        .watch(&tree, &format!("{dir}/"), false)
+        .await
+        .expect("watch through the namespace root");
+    let watched = format!("{dir}/watched.tmp");
+    let (events, write) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), watcher.next_events()),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client.write_file(&mut tree, &watched, b"watch me").await
+        }
+    );
+    write.expect("write_file into the watched directory");
+    let events = events
+        .expect("timed out waiting for a change notification")
+        .expect("next_events failed");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.action == smb2::FileNotifyAction::Added && e.filename == "watched.tmp"),
+        "expected watched.tmp to be reported as added, got {events:?}"
+    );
+    watcher.close().await.expect("watcher close");
+
+    for path in [&written, &watched] {
+        client
+            .delete_file(&mut tree, path)
+            .await
+            .expect("delete_file");
+    }
+    client
+        .delete_directory(&mut tree, dir)
+        .await
+        .expect("delete_directory");
+}
+
 // ── A small credit window (smb-smallcredits) ─────────────────────────
 
 /// Connect as guest to smb-smallcredits, whose window stops at 64 credits.
