@@ -77,6 +77,13 @@ pub enum OpResult {
 /// Each operation runs to completion before the next one starts, including
 /// its internal steps (a read is CREATE + READ + CLOSE). Nothing here
 /// interleaves work from different operations.
+///
+/// **It doesn't follow DFS links.** An operation on a path behind one comes
+/// back as [`OpResult::Error`] with `STATUS_PATH_NOT_COVERED`
+/// ([`ErrorKind::DfsReferral`](crate::ErrorKind::DfsReferral)); this is the
+/// low-level path, and a hidden referral and retry would break its one
+/// operation, one exchange contract. Run that path through an
+/// [`SmbClient`](crate::SmbClient) method instead, which follows the link.
 pub struct Pipeline<'a> {
     conn: &'a mut Connection,
     tree: &'a Tree,

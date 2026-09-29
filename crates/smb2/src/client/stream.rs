@@ -7,6 +7,7 @@
 //! [`FileWriter::finish`] for normal completion, [`FileWriter::abort`] for
 //! fast cancellation), and [`Progress`] for tracking transfer progress.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -97,7 +98,8 @@ impl Progress {
 /// # }
 /// ```
 pub struct FileDownload<'a> {
-    tree: &'a Tree,
+    /// Borrowed from the caller, or owned when a DFS link led elsewhere.
+    tree: Cow<'a, Tree>,
     conn: &'a mut Connection,
     file_id: FileId,
     file_size: u64,
@@ -161,6 +163,30 @@ impl<'a> FileDownload<'a> {
     /// handle when the last chunk arrives.
     pub fn new(
         tree: &'a Tree,
+        conn: &'a mut Connection,
+        file_id: FileId,
+        file_size: u64,
+        chunk_size: u32,
+    ) -> Self {
+        Self::with_tree(Cow::Borrowed(tree), conn, file_id, file_size, chunk_size)
+    }
+
+    /// A download of a file [`Tree::open_file`] just opened, reading
+    /// [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE) at a time (or
+    /// `MaxReadSize`, if that's smaller).
+    pub(crate) fn of_open_file(
+        tree: Cow<'a, Tree>,
+        conn: &'a mut Connection,
+        file_id: FileId,
+        file_size: u64,
+    ) -> Self {
+        let max_read = conn.params().map_or(65536, |p| p.max_read_size);
+        let chunk_size = crate::DOWNLOAD_CHUNK_SIZE.min(max_read);
+        Self::with_tree(tree, conn, file_id, file_size, chunk_size)
+    }
+
+    fn with_tree(
+        tree: Cow<'a, Tree>,
         conn: &'a mut Connection,
         file_id: FileId,
         file_size: u64,
@@ -331,7 +357,7 @@ impl<'a> FileDownload<'a> {
         if let Some(front) = self.in_flight.front_mut() {
             if front.guard.is_none() {
                 let guard =
-                    send_read(self.conn, self.tree, self.file_id, front.offset, front.len).await?;
+                    send_read(self.conn, &self.tree, self.file_id, front.offset, front.len).await?;
                 let now = Instant::now();
                 front.guard = Some(guard);
                 front.dispatched_at = now;
@@ -352,7 +378,7 @@ impl<'a> FileDownload<'a> {
                 Dispatch::AfterHead => return Ok(None),
             }
             let offset = self.next_offset;
-            let guard = send_read(self.conn, self.tree, self.file_id, offset, len).await?;
+            let guard = send_read(self.conn, &self.tree, self.file_id, offset, len).await?;
             let now = Instant::now();
             self.in_flight.push_back(InFlightRead {
                 offset,
@@ -622,7 +648,7 @@ impl Drop for FileDownload<'_> {
 /// # Example
 ///
 /// ```no_run
-/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
 /// let reader = client.open_file_reader(share, "archive.zip").await?;
 /// let size = reader.size();
 /// // Read the 22-byte end-of-central-directory record at the tail, then jump
@@ -843,7 +869,8 @@ impl Drop for FileReader {
 /// # }
 /// ```
 pub struct FileUpload<'a> {
-    tree: &'a Tree,
+    /// Borrowed from the caller, or owned when a DFS link led elsewhere.
+    tree: Cow<'a, Tree>,
     conn: &'a mut Connection,
     file_id: FileId,
     data: &'a [u8],
@@ -861,7 +888,7 @@ impl<'a> FileUpload<'a> {
     /// Opens the file for writing. The caller then drives the upload with
     /// [`write_next_chunk`](FileUpload::write_next_chunk).
     pub(crate) fn new(
-        tree: &'a Tree,
+        tree: Cow<'a, Tree>,
         conn: &'a mut Connection,
         file_id: FileId,
         data: &'a [u8],
@@ -882,7 +909,11 @@ impl<'a> FileUpload<'a> {
 
     /// Create a "done" upload for small files that were already written
     /// via compound in the constructor.
-    pub(crate) fn new_done(tree: &'a Tree, conn: &'a mut Connection, total_bytes: u64) -> Self {
+    pub(crate) fn new_done(
+        tree: Cow<'a, Tree>,
+        conn: &'a mut Connection,
+        total_bytes: u64,
+    ) -> Self {
         Self {
             tree,
             conn,
@@ -1022,7 +1053,7 @@ impl Drop for FileUpload<'_> {
 /// # Example
 ///
 /// ```no_run
-/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
 /// let mut writer = client.create_file_writer(share, "output.bin").await?;
 /// writer.write_chunk(b"first part").await?;
 /// writer.write_chunk(b"second part").await?;
@@ -1119,7 +1150,7 @@ pub async fn open_file_writer_exclusive(
 /// # Example
 ///
 /// ```no_run
-/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
 /// // Append after a 4 KiB prefix already present in the file.
 /// let mut writer = client.create_file_writer_at(share, "patched.bin", 4096).await?;
 /// writer.write_chunk(b"appended tail").await?;
@@ -1336,7 +1367,7 @@ impl FileWriter {
     /// ```no_run
     /// # use std::ops::ControlFlow;
     /// # async fn example(
-    /// #     client: &smb2::SmbClient,
+    /// #     client: &mut smb2::SmbClient,
     /// #     share: &smb2::Tree,
     /// #     cancel: impl Fn() -> bool,
     /// # ) -> Result<(), smb2::Error> {

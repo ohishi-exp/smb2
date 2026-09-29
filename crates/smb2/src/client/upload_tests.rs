@@ -517,7 +517,13 @@ async fn a_step_by_step_upload_paces_like_a_writer() {
     let tree = test_tree();
     let data = vec![7u8; 2 * MIB as usize];
 
-    let mut upload = FileUpload::new(&tree, &mut conn, test_file_id(), &data, 8 * MIB);
+    let mut upload = FileUpload::new(
+        std::borrow::Cow::Borrowed(&tree),
+        &mut conn,
+        test_file_id(),
+        &data,
+        8 * MIB,
+    );
     let mut steps = 0;
     while upload.write_next_chunk().await.unwrap() {
         steps += 1;

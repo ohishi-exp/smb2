@@ -46,6 +46,10 @@ pub(crate) struct Connections {
     /// [`Tree::server`].
     primary_server: String,
     extra: HashMap<String, ConnectionEntry>,
+    /// The target shares DFS links led to, for the calls that follow a link
+    /// without handing the caller a tree: keyed by `addr:port` and lowercased
+    /// share name, stamped with the connection's generation.
+    link_trees: HashMap<(String, String), (u64, Tree)>,
 }
 
 impl Connections {
@@ -54,7 +58,40 @@ impl Connections {
             primary,
             primary_server,
             extra: HashMap::new(),
+            link_trees: HashMap::new(),
         }
+    }
+
+    /// The tree a DFS link already led to on `addr`'s `share`, if it's still
+    /// good.
+    ///
+    /// ❌ **One per target share, never one per call.** Every `download` or
+    /// writer through a link would otherwise TREE_CONNECT again and never
+    /// disconnect, since the handle holding the tree can't. The generation
+    /// check drops a tree whose connection came back on a new session, where
+    /// its id means nothing.
+    pub(crate) fn link_tree(&self, addr: &str, share: &str) -> Option<Tree> {
+        let (generation, tree) = self.link_trees.get(&link_key(addr, share))?;
+        let conn = self.for_tree_ref(tree).ok()?;
+        (conn.generation() == *generation).then(|| tree.clone())
+    }
+
+    /// Remember the tree a DFS link led to, for [`link_tree`](Self::link_tree).
+    pub(crate) fn remember_link_tree(&mut self, tree: &Tree) {
+        let Ok(conn) = self.for_tree_ref(tree) else {
+            return;
+        };
+        let generation = conn.generation();
+        self.link_trees.insert(
+            link_key(&tree.server, &tree.share_name),
+            (generation, tree.clone()),
+        );
+    }
+
+    /// Stop handing out `tree`, because its tree connect is being torn down.
+    pub(crate) fn forget_link_tree(&mut self, tree: &Tree) {
+        self.link_trees
+            .retain(|_, (_, known)| known.server != tree.server || known.tree_id != tree.tree_id);
     }
 
     /// The connection `tree` lives on.
@@ -139,7 +176,13 @@ impl Connections {
     /// `Error::Disconnected` from here on.
     pub(crate) fn clear_extras(&mut self) {
         self.extra.clear();
+        self.link_trees.clear();
     }
+}
+
+/// Share names are case-insensitive on every SMB server.
+fn link_key(addr: &str, share: &str) -> (String, String) {
+    (addr.to_string(), share.to_lowercase())
 }
 
 fn orphaned(tree: &Tree) -> Error {

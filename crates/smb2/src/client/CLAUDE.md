@@ -182,7 +182,7 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 - **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`), `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`), and `resolved_name` (`resolve.rs`, share-relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
 - **What is deliberately NOT mapped**: share names, tree-connect paths, the `srvsvc` pipe name, DFS referral *server* and *share* fields, and the `*` search pattern in QUERY_DIRECTORY. Those aren't file names, and the wildcard is meant to be a wildcard.
 - **`/` is the only separator a caller can write.** A `\` is a name character (U+F026). `Tree::rename`'s target, `SmbClient::upload`, `Tree::download`, and the DFS remaining-path all go through the same codec so one convention holds end to end.
-- **DFS referral paths are encoded too** (`SmbClient::handle_dfs_redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
+- **DFS referral paths are encoded too** (`SmbClient::redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
 
 ## Compound requests
 
@@ -223,14 +223,36 @@ a quirk — and `STATUS_PATH_NOT_COVERED` is never returned. `connect_share` che
 (§ 3.1.4.1 step 2), otherwise tree-connects, and on refusal asks for a ROOT referral and connects the target, following
 an Interlink by re-resolving and stopping at `MAX_DFS_HOPS`.
 
-**A link, at any convenience method.** `STATUS_PATH_NOT_COVERED` (mapped to `ErrorKind::DfsReferral`) sends
-`handle_dfs_redirect` to resolve the referral, connect the target, update the caller's `&mut Tree` in place, and retry
-with the resolved remaining path.
+**A link, at every `SmbClient` call that takes a path.** A CREATE refused with `STATUS_PATH_NOT_COVERED` sends
+`follow_dfs_link` to resolve the referral, connect the target, and run the call once more there with the remaining path.
+It's the one place that happens; every entry point goes through it, via one of two wrappers:
 
-- ❌ **A failed referral must never replace the original error.** The overwhelmingly common cause of
-  `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them
+- **`on_tree`**, for the `&mut Tree` convenience methods: the caller's tree moves onto the target (a fresh tree connect
+  of its own, since the caller may disconnect it), so later paths on it are target-relative.
+- **`beside_tree`**, for everything that leaves the tree alone: `download`, `upload`, `watch`, the four handle openers,
+  and the batches. The handle keeps the target tree, the caller's stays on its share. These share one tree connect per
+  target share (`Connections::link_tree`, stamped with the connection's generation, dropped by `disconnect_share` and on
+  reconnect). ❌ Don't tree-connect per call here: a handle can't disconnect its tree, so every copy out of a link would
+  leak one.
+- **Once only.** A target answering `STATUS_PATH_NOT_COVERED` in turn is the caller's answer.
+- ❌ **Only a refused CREATE triggers it** (`is_dfs_link`), never `ErrorKind::DfsReferral` on any command. That's what
+  makes the retry safe for the progress and streamed calls, which run only their open through the helper and the rest
+  afterwards on the tree it returns, so no callback runs and no source chunk is pulled before the redirect.
+- ❌ **The op gets owned clones** (`Connection`, `Tree`, `String`). An `AsyncFnMut` over borrowed arguments reads better
+  and compiles, but rustc can't prove its future `Send` (higher-ranked lifetimes), and consumers spawn these calls.
+  `dfs_following_futures_stay_send` fails if it regresses.
+- **Batches follow item by item**, on the caller's tree: the first linked item pays the referral, the rest hit the cache,
+  and items outside the link stay on the share. Moving the batch onto the target would send the other items'
+  share-relative paths to the wrong share, which for `delete_files` means deleting a same-named file there.
+- **A rename carries its destination along** only within one directory (`link_rename_target`): SET_INFO's destination is
+  share-relative, and anything else may leave the link. Otherwise it keeps `STATUS_PATH_NOT_COVERED`.
+- **`Pipeline` doesn't follow links**: it reports `STATUS_PATH_NOT_COVERED` per op, since a hidden referral would break
+  its one-op, one-exchange contract. Its rustdoc says so.
+
+- ❌ **A failed referral must never replace the original error**, for a root or a link. The overwhelmingly common cause
+  of `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them
   nothing. A referral that fails, is empty, or names nothing connectable gives back the refusal. The one exception is
-  `Error::DfsNoReachableTarget`: the namespace is real, and its storage is not reachable.
+  `Error::DfsNoReachableTarget`: the namespace or link is real, and its storage is not reachable.
 - **The trigger is gated on the negotiated `SMB2_GLOBAL_CAP_DFS`**, so a plain NAS pays zero extra round-trips when
   someone mistypes a share name.
 - ❌ **Never gate on `ServerType`.** Samba answers a root referral with `0` and header flags `0x02` where Windows
@@ -266,8 +288,7 @@ with the resolved remaining path.
   reports when a server asked for it.
 
 **Key design decisions:**
-- ❌ **Every call that takes a `Tree` goes through the tree's own connection** (`Connections::for_tree`, or
-  `for_tree_ref` + `clone()` for a `&self` handle opener), never `primary_mut()`. A DFS target's `TreeId` means nothing
+- ❌ **Every call that takes a `Tree` goes through the tree's own connection** (`Connections::for_tree`), never `primary_mut()`. A DFS target's `TreeId` means nothing
   to the primary's session: it fails with `STATUS_NETWORK_NAME_DELETED`, or, when the small per-session ids collide,
   reads or writes a same-named file on a different share. The primary is private to `Connections` so this can't happen
   by reaching for a field; `every_tree_call_goes_out_on_the_trees_own_connection` pins the handle and streaming calls.
@@ -279,11 +300,12 @@ with the resolved remaining path.
   `ClientConfig::dfs_target_overrides`.
 - Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
-- Streaming methods (`download`, `upload`) keep `&Tree` because they return handles that borrow the tree for their lifetime
+- Streaming methods (`download`, `upload`) keep `&Tree`: `FileDownload` / `FileUpload` hold a `Cow<'a, Tree>`, borrowed
+  from the caller or owning the link's target, so the public shape didn't change
+- The handle openers take `&mut self`: following a link can dial a new connection into the pool
 - `watch` returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
-- Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
-- `Connections` is its own field, so `handle_dfs_redirect` and `root_referral` borrow it beside `dfs_resolver` without inlining the lookup
+- `Connections` is its own field, so `redirect` and `root_referral` borrow it beside `dfs_resolver` without inlining the lookup
 
 ## Watcher pipelining
 
@@ -303,11 +325,11 @@ For large files, `read_file_pipelined` issues multiple `execute_with_credits` ca
 
 `FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` — no lifetime parameter, no borrow against the `SmbClient` that built it. It buffers pushed bytes and hands them to its `WritePipe` one WRITE at a time; `finish` / `abort` drain the pipe, then FLUSH (finish only) and CLOSE.
 
-FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, and waiting for the window to have room is the backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the tree's own connection internally for convenience.
+FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, and waiting for the window to have room is the backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&mut self, tree, path)` — the last clones the tree's own connection internally and follows a DFS link.
 
 ## Random-access reads (`FileReader`)
 
-`FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the tree's own connection).
+`FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&mut self, tree, path)` (clones the tree's own connection, follows a DFS link).
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
 

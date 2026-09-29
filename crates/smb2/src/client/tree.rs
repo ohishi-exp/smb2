@@ -1713,13 +1713,30 @@ impl Tree {
         &self,
         conn: &mut Connection,
         path: &str,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<Vec<u8>>
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
         let (file_id, file_size) = self.open_file(conn, path).await?;
+        self.read_open_file_with_progress(conn, path, file_id, file_size, on_progress)
+            .await
+    }
 
+    /// The rest of [`read_file_pipelined_with_progress`](Self::read_file_pipelined_with_progress),
+    /// once the file is open: reads it all, reporting each chunk, then
+    /// closes it. `path` is for the log.
+    pub(crate) async fn read_open_file_with_progress<F>(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        file_id: FileId,
+        file_size: u64,
+        mut on_progress: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(Progress) -> ControlFlow<()>,
+    {
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
@@ -1815,10 +1832,11 @@ impl Tree {
         path: &str,
     ) -> Result<FileDownload<'a>> {
         let (file_id, file_size) = self.open_file(conn, path).await?;
-        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-        let chunk_size = crate::DOWNLOAD_CHUNK_SIZE.min(max_read);
-        Ok(FileDownload::new(
-            self, conn, file_id, file_size, chunk_size,
+        Ok(FileDownload::of_open_file(
+            std::borrow::Cow::Borrowed(self),
+            conn,
+            file_id,
+            file_size,
         ))
     }
 
@@ -2001,7 +2019,21 @@ impl Tree {
 
         // Open (or create) the file for writing.
         let file_id = self.open_file_for_write(conn, path).await?;
+        self.write_open_file_streamed(conn, file_id, next_chunk)
+            .await
+    }
 
+    /// The rest of [`write_file_streamed`](Self::write_file_streamed), once
+    /// the file is open: pulls and writes every chunk, flushes, and closes.
+    pub(crate) async fn write_open_file_streamed<F>(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        next_chunk: &mut F,
+    ) -> Result<u64>
+    where
+        F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
+    {
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
 

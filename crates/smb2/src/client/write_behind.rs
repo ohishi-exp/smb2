@@ -90,7 +90,7 @@ pub const UPLOAD_CHUNK_SIZE: u32 = 512 * 1024;
 /// # Example
 ///
 /// ```no_run
-/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
 /// use smb2::WriteBehind;
 ///
 /// // The behavior before 0.25: `MaxWriteSize` WRITEs, 32 in flight.

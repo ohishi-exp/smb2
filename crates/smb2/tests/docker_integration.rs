@@ -2590,6 +2590,194 @@ async fn dfs_write_and_read_roundtrip() {
     }
 }
 
+// ── DFS links in every call (smb-dfs-root `data` -> smb-dfs-target `files`) ──
+//
+// The streaming, handle, batch, and watch calls follow the link and leave the
+// caller's tree on the root share, so one tree keeps serving both the link and
+// the root share's own files.
+
+/// Read a whole download into memory.
+async fn drain(mut download: smb2::client::FileDownload<'_>) -> Vec<u8> {
+    let mut received = Vec::new();
+    while let Some(chunk) = download.next_chunk().await {
+        received.extend_from_slice(&chunk.expect("next_chunk failed"));
+    }
+    received
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_link_download_reads_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let tree = client.connect_share("dfs").await.expect("connect_share");
+
+    let hello = drain(
+        client
+            .download(&tree, "data/hello.txt")
+            .await
+            .expect("download through the link"),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8_lossy(&hello).trim(),
+        "Hello from DFS target!"
+    );
+
+    // Again, deeper: the second trip reuses the referral and the target share.
+    let nested = drain(
+        client
+            .download(&tree, "data/subdir/nested.txt")
+            .await
+            .expect("second download through the link"),
+    )
+    .await;
+    assert_eq!(String::from_utf8_lossy(&nested).trim(), "Nested file");
+
+    // The caller's tree never moved, so the root share's own file still opens.
+    assert_eq!(tree.share_name, "dfs");
+    let root = drain(
+        client
+            .download(&tree, "Root-File.txt")
+            .await
+            .expect("download from the root share itself"),
+    )
+    .await;
+    assert_eq!(String::from_utf8_lossy(&root).trim(), "root");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_link_file_writer_and_reader_reach_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let path = "data/_dfs_link_writer.tmp";
+
+    let mut writer = client
+        .create_file_writer(&tree, path)
+        .await
+        .expect("create_file_writer through the link");
+    writer
+        .write_chunk(b"written through the link")
+        .await
+        .expect("write_chunk");
+    writer.finish().await.expect("finish");
+
+    let reader = client
+        .open_file_reader(&tree, path)
+        .await
+        .expect("open_file_reader through the link");
+    let back = reader.read_at(0, 64).await.expect("read_at");
+    reader.close().await.expect("reader close");
+    assert_eq!(back, b"written through the link");
+
+    let results = client.delete_files(&mut tree, &[path]).await;
+    assert!(results.iter().all(|r| r.is_ok()), "cleanup: {results:?}");
+    assert_eq!(tree.share_name, "dfs");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_link_batches_follow_the_link_item_by_item() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let (a, b) = ("data/_dfs_link_batch_a.tmp", "data/_dfs_link_batch_b.tmp");
+    for path in [a, b] {
+        let mut writer = client
+            .create_file_writer(&tree, path)
+            .await
+            .expect("writer");
+        writer.write_chunk(b"batch").await.expect("write_chunk");
+        writer.finish().await.expect("finish");
+    }
+
+    // Two items behind the link and one in the root share, in one batch.
+    let stats = client.stat_files(&mut tree, &[a, "Root-File.txt", b]).await;
+    let sizes: Vec<u64> = stats
+        .into_iter()
+        .map(|s| s.expect("stat_files item").size)
+        .collect();
+    assert_eq!(sizes, [5, 5, 5]);
+
+    let renamed = "data/_dfs_link_batch_renamed.tmp";
+    let results = client.rename_files(&mut tree, &[(a, renamed)]).await;
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "rename_files: {results:?}"
+    );
+
+    let results = client.delete_files(&mut tree, &[renamed, b]).await;
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "delete_files: {results:?}"
+    );
+    assert_eq!(
+        tree.share_name, "dfs",
+        "a batch leaves the caller's tree put"
+    );
+
+    let gone = client.stat_files(&mut tree, &[renamed, b]).await;
+    assert!(
+        gone.iter().all(|r| r
+            .as_ref()
+            .is_err_and(|e| e.kind() == smb2::ErrorKind::NotFound)),
+        "expected both deleted, got {gone:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_link_watch_sees_changes_on_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    // Its own directory, so the other DFS tests writing into `data` stay quiet.
+    // `create_directory` moves the tree it's given, so it gets a copy.
+    let dir = "data/_dfs_link_watch";
+    let mut on_target = tree.clone();
+    let _ = client.create_directory(&mut on_target, dir).await;
+
+    let mut watcher = client
+        .watch(&tree, dir, false)
+        .await
+        .expect("watch through the link");
+    let watched = "data/_dfs_link_watch/_dfs_link_watched.tmp";
+    let (events, write) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), watcher.next_events()),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut writer = client.create_file_writer(&tree, watched).await?;
+            writer.write_chunk(b"watch me").await?;
+            writer.finish().await
+        }
+    );
+    write.expect("write into the watched directory");
+    let events = events
+        .expect("timed out waiting for a change notification")
+        .expect("next_events failed");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.action == smb2::FileNotifyAction::Added
+                && e.filename == "_dfs_link_watched.tmp"),
+        "expected the file to be reported as added, got {events:?}"
+    );
+    watcher.close().await.expect("watcher close");
+
+    let results = client.delete_files(&mut tree, &[watched]).await;
+    assert!(results.iter().all(|r| r.is_ok()), "cleanup: {results:?}");
+    client
+        .delete_directory(&mut on_target, "_dfs_link_watch")
+        .await
+        .expect("delete_directory");
+}
+
 // ── Streamed write (smb-guest) ──────────────────────────────────────
 
 #[tokio::test]
