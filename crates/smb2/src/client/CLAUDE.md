@@ -212,8 +212,9 @@ Decision/Why — these are convenience, not throughput. Each item costs one roun
 
 ## DFS (Distributed File System) resolution
 
-**Two entry points, because a namespace root and a link fail in completely different places.** Design and evidence:
-`docs/specs/dfs-namespace-root-plan.md` (roots) and `docs/specs/dfs-implementation-plan.md` (links).
+**Two entry points, because a namespace root and a link fail in completely different places.** Cross-module traps:
+`AGENTS.md` pitfall 25. The referral wire format: `src/msg/CLAUDE.md`. The fixtures and what they can't prove:
+`tests/CLAUDE.md` § Docker integration tests.
 
 **A namespace root, at `connect_share`.** `\\<domain>\<namespace>` is not a share on the server answering that name,
 so its TreeConnect is refused with `STATUS_BAD_NETWORK_NAME` — required by MS-SMB2 § 3.3.5.7, so a contract rather than
@@ -246,7 +247,30 @@ with the resolved remaining path.
 - **A root target is `\\server\share` and nothing more** (§ 2.2.1.6). A target carrying a path suffix is skipped, not
   silently truncated: a `Tree` cannot express one, and dropping it would open the wrong directory.
 
+- **A cache hit is terminal** in `connect_share`: falling back to a plain TreeConnect when the cached targets don't
+  answer would resolve the namespace twice on the one path where the wait is already long. An expired entry is a miss,
+  so a namespace that has become an ordinary share is found again then.
+- **Why the trigger costs nothing off DFS**: a server that negotiated `CAP_DFS` pays a few extra frames on an error
+  path, a plain NAS none, and a successful TreeConnect never pays anything.
+
+**Not implemented, on purpose** (the open follow-ups are GitHub issues):
+- **DC and domain referrals** (§ 3.1.4.1 reaches for them only through a DomainCache, which a client that isn't
+  domain-joined never has). NameListReferral entries are parsed so they can't be misread, never requested. So a
+  NetBIOS-only domain name that DNS can't resolve stays unsupported.
+- **`FSCTL_DFS_GET_REFERRALS_EX`**: its only extra payload is the client's AD site name, which a non-joined client
+  doesn't know.
+- **Soft and hard TTLs** (§ 3.1.1): one hard expiry, since the split buys a background refresh with no scheduler to run
+  it, and 600–1800 s TTLs make the saving small.
+- **Target failback** (§ 3.1.5.4.3): it needs health checks of a target we moved off. `DfsCacheEntry::target_failback`
+  reports when a server asked for it.
+
 **Key design decisions:**
+- **A pool of extra connections, keyed by `host:port`**, never replacing the primary: replacing it would invalidate
+  every `Tree` the caller already holds.
+- **The DFS header flag follows the tree** (`Connection::register_dfs_tree`), so no call site threads an `is_dfs`
+  argument.
+- **Referral targets dial port 445**: UNC paths carry no port, and 445 is universal in production. Tests remap them with
+  `ClientConfig::dfs_target_overrides`.
 - Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
 - Streaming methods (`download`, `upload`) keep `&Tree` because they return handles that borrow the tree for their lifetime
@@ -467,13 +491,13 @@ Full rationale in `durable.rs`'s module docs. `Tree::open_file_durable` asks for
 
 Gotcha/Why — there is no split `send_request` / `receive_response` API, so tests can't hand-drive the two halves. Tests that build mocks without going through `setup_connection` call `mock.enable_auto_rewrite_msg_id()`, which rewrites each queued response's zero-msg_id to match the next pending sent msg_id in FIFO order.
 
-Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-actor.md).
+Decisions behind this shape (cited by ID from code, like decision E3), and what was left out on purpose: `docs/connection-actor.md` at the repo root.
 
 ## Key decisions
 
 - **Owned `FileWriter`: N concurrent streamed writes over one Connection without external locking**: `FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` instead of borrowing `&'a mut Connection` from the `SmbClient`. Built via the free `open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str)` or one of the two convenience wrappers (`Tree::create_file_writer`, `SmbClient::create_file_writer`). Multiple writers built from clones of the same `Connection` pipeline their WRITEs over one SMB session — the receiver task multiplexes responses by `MessageId`. The borrowed variant was the root cause of a production-reproducing deadlock in the cmdr SMB volume's `write_from_stream` (Phase C QNAP test, 200 × 7 MB concurrent overwrites): the consumer had to hold its session mutex for the entire upload because the writer borrowed `&'a mut Connection`. Owning the connection removes the lock from the hot path entirely.
 - **`execute` / `execute_compound` take `&self`**: `Connection: Clone` supports concurrent ops per connection — clone freely across tasks, the receiver task multiplexes responses by `MessageId`. `Tree::*` methods still take `&mut Connection` because session-setup mutators (`activate_signing`, `set_session_id`) keep `&mut self`; Tree code calls both, so `&mut` at that layer is the least-churn choice.
-- **Sender work stays on the caller thread, only the receiver is a task**: The send path already uses an internal Mutex on the transport write half for ordering; adding a second task just to drive sends would add latency without correctness gain. The receiver bug (orphan/dropped-caller frames corrupting the wire) only existed on the receive side, so only the receive side needed a task.
+- **One task owns each half of the socket**: the receiver routes, the writer (§ The send path) is the only thing that writes. Both exist for correctness, not speed: a dropped caller must not corrupt the next response, and a cancelled send must not leave half a frame on the wire.
 - **Compound reads as default**: One round-trip for small files. Saves 2 RTTs vs sequential CREATE/READ/CLOSE.
 - **512 KB pipeline chunks**: Balances between too many small requests (overhead) and too few large ones (credit starvation). Gives ~20 chunks per 10 MB file.
 - **Password stored in `SmbClient`**: Enables reconnect without re-prompting. Not encrypted in memory. Drop when done.
@@ -483,7 +507,7 @@ Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-acto
 - **Preauth hash excludes the final success response**: Only STATUS_MORE_PROCESSING_REQUIRED responses are hashed. Including the success response produces wrong keys. (MS-SMB2 3.2.5.3.1)
 - **Oplock break notifications arrive with MessageId 0xFFFFFFFFFFFFFFFF**: The receiver task detects these and skips them without invoking a waiter lookup.
 - **Register-waiter must be atomic with `disconnected` check**: The waiters lock covers both reading `disconnected` and inserting the `oneshot::Sender`. If the check and insert were racy, a receiver-task failure mid-send could leave an orphan `Sender` in the map that never gets routed — caller would hang on `rx.await` forever. Same goes for `fan_error_to_waiters`: it sets `disconnected=true` UNDER the same waiters lock before draining, so new sends strictly either succeed-and-get-drained or fail at the insert check.
-- **Unrecoverable frame errors tear down the connection** (Phase 3 P3.4): decrypt failure, decompress failure, or a malformed sub-frame header that survives `split_compound` all cause the receiver task to call `fan_error_to_waiters(Err(Disconnected))` and exit. The alternative — log-and-continue — would leave the matching waiter hanging forever, because the msg_id isn't recoverable from an unparseable frame. The connection is also out of sync after one bad frame, so reconnect is the right move anyway. Counted via `MetricsSnapshot::{decrypt_failures, decompress_failures, malformed_frames}`.
+- **Unrecoverable frame errors tear down the connection** (decision E6): decrypt failure, decompress failure, or a malformed sub-frame header that survives `split_compound` all cause the receiver task to call `fan_error_to_waiters(Err(Disconnected))` and exit. The alternative — log-and-continue — would leave the matching waiter hanging forever, because the msg_id isn't recoverable from an unparseable frame. The connection is also out of sync after one bad frame, so reconnect is the right move anyway. Counted via `MetricsSnapshot::{decrypt_failures, decompress_failures, malformed_frames}`.
 - **STATUS_PENDING loop**: CHANGE_NOTIFY and other long-poll operations get STATUS_PENDING first. The receiver task keeps the waiter registered on PENDING and does NOT forward the interim response. Credits from PENDING are still banked, and the waiter's `last_activity` is refreshed so the response deadline restarts. Counted via `MetricsSnapshot::status_pending_loops`.
 - **Signing and encryption are mutually exclusive on the wire**: When encrypting, zero the signature field (AEAD provides integrity). On receive, skip signature verification if decryption succeeded.
 - **Compound encryption wraps the entire chain**: One TRANSFORM_HEADER for all sub-requests concatenated, not per sub-request.
@@ -494,4 +518,4 @@ Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-acto
 - **DFS redirect changes the tree in-place**: After a DFS redirect, `tree.server`, `tree.share_name`, and `tree.tree_id` all change. Subsequent operations on the same tree use the target server directly -- they must use target-relative paths, not the original DFS paths.
 - **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `connection_for_tree` can distinguish servers that share the same hostname but use different ports.
 - **Every write that creates a file comes in a replacing and an exclusive form**: `write_file_compound` / `create_file_writer` use `FileOverwriteIf` (create or replace); `write_file_compound_exclusive` / `create_file_writer_exclusive` use `FileCreate`, which the server refuses atomically with `STATUS_OBJECT_NAME_COLLISION` (`ErrorKind::AlreadyExists`, an `Error::Protocol` naming the CREATE) if the name exists. A consumer that checked a name was free and then writes must use the exclusive form: the replacing one silently overwrites a file another writer put there in between. The disposition stays private (`*_with_disposition`), so the public surface is exactly these pairs.
-- **Servers MAY split compound responses**: MS-SMB2 section 3.3.4.1.3 says the server SHOULD compound responses but is not required to. Samba (and QNAP firmware built on it) is known to split compound chains into separate frames in some scenarios; Windows Server does too under certain conditions. Compound-using methods (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`, batch `*_files`) call `Connection::receive_compound_expected(n)` instead of `receive_compound()`, which transparently gathers additional frames if the server splits. Logged at DEBUG, not WARN -- it's a spec edge case, not a problem.
+- **Servers MAY split compound responses**: MS-SMB2 section 3.3.4.1.3 says the server SHOULD compound responses but is not required to. Samba (and QNAP firmware built on it) is known to split compound chains into separate frames in some scenarios; Windows Server does too under certain conditions. The receiver task routes each sub-response by its `MessageId`, so `execute_compound` reassembles a split chain in submission order and no caller sees the difference (§ Receiving compound responses). Nothing counts or logs a split.

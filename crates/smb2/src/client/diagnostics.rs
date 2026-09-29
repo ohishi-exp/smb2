@@ -50,7 +50,37 @@
 //! [`SmbClient::reconnect`](crate::SmbClient::reconnect) calls, while
 //! `reconnects_succeeded` counts every revival including the automatic ones.
 //!
-//! See `docs/specs/diagnostics-plan.md` for the design rationale.
+//! ## Why a snapshot, and no event stream
+//!
+//! - **What consumers want is state.** Credits, the in-flight count, the
+//!   negotiated dialect, and counter totals describe *now*, not a sequence of
+//!   past events.
+//! - **The events already have a channel.** Oplock breaks, session expiry, DFS
+//!   failovers, and decrypt failures all go through the `log` facade; a
+//!   consumer that wants a timeline subscribes there.
+//! - **Polling is close to free**: a handful of atomic loads and a few short
+//!   critical sections, so a 1 Hz dashboard is below noise.
+//! - **An event channel can't be taken back.** Its bounding and drop policy
+//!   become a forever decision for every consumer. A future `event_stream()`
+//!   can sit next to `diagnostics()` if a real workload asks for one.
+//!
+//! ## What it deliberately leaves out
+//!
+//! - **No reset.** Counters are monotonic; diff two snapshots for a rate.
+//! - **No key material**: lengths, algorithm ids, and active flags only.
+//! - **No caller-owned objects.** Open handles, `FileDownload`s, `FileWriter`s,
+//!   and `Watcher`s belong to the caller, who folds their progress into their
+//!   own view; tracking them here would mean registering every one back.
+//! - **No per-NTSTATUS histogram** yet: too noisy to be worth a field.
+//!
+//! ## Stability
+//!
+//! Every type that can plausibly grow is `#[non_exhaustive]`, so a new field is
+//! a minor change. [`SigningInfo`], [`EncryptionInfo`], and
+//! [`CompressionInfo`] aren't, because the protocol fixes their shape and
+//! tests can build them with struct literals. The `Display` format is for
+//! humans and may change; use the `serde` feature (serialize only, never read
+//! back) for anything programmatic.
 
 use std::fmt;
 use std::time::Duration;

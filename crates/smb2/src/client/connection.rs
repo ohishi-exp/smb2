@@ -3,12 +3,13 @@
 //! The [`Connection`] type manages a single TCP connection to an SMB server.
 //! A background receiver task owns the transport's read half, demultiplexes
 //! incoming frames by `MessageId`, and routes each response to the matching
-//! per-request `oneshot::Sender`. The caller-thread path holds the write
-//! half (guarded by its own Mutex via the transport trait) and pushes a
-//! per-request `oneshot::Receiver` onto a FIFO that `receive_response`
-//! pops from.
+//! per-request `oneshot::Sender`. A writer task owns the write half, so a
+//! caller hands it whole frames and never touches the socket. Callers use
+//! [`Connection::execute`] / [`Connection::execute_compound`], each of which
+//! owns its `oneshot::Receiver` locally.
 //!
-//! See `docs/specs/connection-actor.md` for the full design (Phase 2).
+//! Decisions and their why (the IDs cited below, like decision E3):
+//! `docs/connection-actor.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::pin;
@@ -1624,16 +1625,6 @@ impl CryptoState {
     }
 }
 
-/// Shared connection state held in an `Arc` by the caller-facing `Connection`
-/// (including all its clones) and the spawned receiver task.
-///
-/// Phase 3 Stage A.1 moved all connection-wide state here so `Connection`
-/// can be `Clone`: each clone shares the same `Arc<Inner>` and therefore
-/// sees the same credits, session id, negotiated params, and crypto state.
-/// Phase 3 Stage A.3 removed the legacy caller-local FIFO and orphan-filter
-/// fallback channel; `execute` / `execute_compound` own their per-call
-/// `oneshot::Receiver`s locally, so there is no per-clone bookkeeping at
-/// all now — `Connection` is just a handle to `Arc<Inner>`.
 /// Where a connection reads its inbound byte counts from.
 ///
 /// The counts belong to the TRANSPORT, because only the transport sees a frame
@@ -1649,6 +1640,14 @@ struct Inbound {
     retired_bytes: u64,
 }
 
+/// Shared connection state, held in an `Arc` by every `Connection` clone and
+/// (weakly) by the background tasks.
+///
+/// All connection-wide state lives here, which is what makes `Connection`
+/// `Clone`: each clone sees the same credits, session id, negotiated params,
+/// and crypto state. `execute` / `execute_compound` own their per-call
+/// `oneshot::Receiver`s locally, so a clone carries no bookkeeping of its own;
+/// `Connection` is only a handle to `Arc<Inner>`.
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
     waiters: StdMutex<HashMap<MessageId, Waiter>>,
@@ -2524,11 +2523,8 @@ impl Inner {
         }
     }
 
-    /// Snapshot the counters into a plain-value `MetricsSnapshot`.
-    ///
-    /// M2 promotes this to `Connection::diagnostics()`'s caller — until
-    /// then it's crate-internal so M1 tests can assert counter ticks
-    /// without committing to the public snapshot API shape.
+    /// Snapshot the counters into a plain-value `MetricsSnapshot`, for
+    /// `Connection::diagnostics()`.
     pub(crate) fn metrics_snapshot(&self) -> crate::client::diagnostics::MetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -2540,9 +2536,10 @@ impl Inner {
 /// after the connection has torn down returns the final values at the
 /// moment of death.
 ///
-/// See `docs/specs/diagnostics-plan.md` § Counters for the rationale
-/// behind each field and the disjoint partition of the receive-side
-/// routing branches.
+/// Each field's meaning, and the disjoint partition of the receive-side
+/// routing branches, is documented on the matching field of
+/// [`MetricsSnapshot`](crate::client::diagnostics::MetricsSnapshot). The
+/// design rationale is in the `diagnostics` module docs.
 #[derive(Default)]
 pub(crate) struct Metrics {
     // Send path
@@ -3904,7 +3901,7 @@ impl Connection {
     /// routing handles that transparently; each sub-op's waiter resolves
     /// independently.
     ///
-    /// Return shape (per decision E3 in `docs/specs/connection-actor.md`):
+    /// Return shape (per decision E3 in `docs/connection-actor.md`):
     ///
     /// - Outer `Result`: `Err` if the compound didn't make it onto the wire
     ///   (encryption failed, signing failed, transport send failed, or the
@@ -5568,7 +5565,7 @@ async fn receiver_loop(
             inner.waiters.lock().unwrap().len()
         );
 
-        // Decrypt if TRANSFORM_HEADER. Per P3.4 / decision E6: on an
+        // Decrypt if TRANSFORM_HEADER. Per decision E6: on an
         // unrecoverable frame error (decrypt auth tag mismatch, decompress
         // failure, malformed sub-frame structure) we tear the connection
         // down instead of log-and-continue. The msg_id isn't recoverable
@@ -7575,22 +7572,6 @@ mod tests {
 
     // ── Unsolicited oplock break tests ─────────────────────────────
 
-    // ── Phase 2 (actor + oneshot routing) red tests ─────────────────
-    //
-    // These tests pin the invariants the Phase 2 refactor must establish.
-    // They target the cancellation-by-drop failure mode that Phase 1's
-    // `HashSet<MessageId>` demux cannot solve: when a caller's future is
-    // dropped mid-flight (for example, by `tokio::task::JoinHandle::abort()`),
-    // the in-flight MessageIds stay in `pending`; server responses for those
-    // ids then get handed to the next caller as if they were legitimate.
-    //
-    // Post-Phase-2, each in-flight request carries its own `oneshot::Sender`;
-    // when the caller's `Receiver` is dropped (future aborted), the receiver
-    // task discards the response silently on arrival.
-    //
-    // These tests fail against current code (Phase 1). They must pass after
-    // Phase 2 lands. See `docs/specs/connection-actor.md`.
-
     // ── Phase 3 (silent-discard fix) red test ───────────────────────
     //
     // Pins the invariant that an unrecoverable frame-level error
@@ -8681,12 +8662,10 @@ mod tests {
 
     /// Confirms clones share the same connection-wide state via `Arc<Inner>`.
     ///
-    /// Design note (Option A from `docs/specs/connection-actor.md` review):
-    /// a cloned `Connection` starts with an EMPTY caller-local `pending_fifo`.
-    /// `oneshot::Receiver` isn't `Clone`, and in-flight waiters belong to
-    /// the task that sent the request — a new clone is a fresh sender
-    /// handle to the same actor, not a snapshot. Credits, session id,
-    /// negotiated params, and crypto state are shared.
+    /// A clone is a fresh handle to the same actor, not a snapshot: in-flight
+    /// waiters belong to the task that sent the request (`oneshot::Receiver`
+    /// isn't `Clone`), while credits, session id, negotiated params, and
+    /// crypto state are shared.
     #[tokio::test]
     async fn connection_is_cloneable_and_clones_share_state() {
         let mock = Arc::new(MockTransport::new());
