@@ -1,0 +1,6 @@
+# Copy to .dev.vars (gitignored). Defaults match the smb-auth Docker fixture.
+SMB_HOST=127.0.0.1
+SMB_PORT=10446
+SMB_USER=testuser
+SMB_PASS=testpass
+SMB_SHARE=private

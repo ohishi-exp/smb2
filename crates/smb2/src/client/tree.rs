@@ -6,7 +6,10 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// std's clock, or `performance.now()` on wasm32, where std's panics.
+use crate::rt::std_time::Instant;
 
 use log::{debug, info, trace, warn};
 
@@ -1669,7 +1672,7 @@ impl Tree {
             path, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
         );
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = self
             .read_pipelined_loop(
                 conn,
@@ -1909,7 +1912,7 @@ impl Tree {
             conn.credits()
         );
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = async {
             let mut sent = 0;
             while sent < data.len() {
@@ -2037,7 +2040,7 @@ impl Tree {
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = write_streamed(&mut pipe, next_chunk).await;
 
         // Flush to ensure data is persisted on the server.

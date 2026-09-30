@@ -1,6 +1,7 @@
 # smb2
 
-Pure-Rust SMB2/3 client with pipelined I/O. No C dependencies, no FFI. Async, on tokio (default) or smol.
+Pure-Rust SMB2/3 client with pipelined I/O. No C dependencies, no FFI. Async, on tokio (default) or smol, or on a
+single-threaded wasm32 host such as Cloudflare Workers (`wasm`, with a caller-supplied transport).
 
 This repo is a Cargo workspace holding two published crates:
 
@@ -80,8 +81,9 @@ src/
     dfs.rs                # DFS referral request/response wire format
 
   transport/              # Transport abstraction
-    mod.rs                # Transport trait (split send/receive)
-    tcp.rs                # Direct TCP (port 445)
+    mod.rs                # Transport trait (split send/receive), TransportFactory (bring your own connection)
+    connect.rs            # ConnectOptions, ConnectAttempt (in every build, the socketless one included)
+    tcp.rs                # Direct TCP (port 445); tokio / smol builds only
     progress.rs           # ReceiveProgress: live byte counts for a frame still arriving
     mock.rs               # Mock transport for testing
 
@@ -99,9 +101,10 @@ src/
     mod.rs                # RPC PDU types, NDR encoding/decoding
     srvsvc.rs             # NetShareEnumAll (list shares on a server)
 
-  rt/                     # The async runtime (tokio or smol): spawn, timers, sockets. Crate-private
-    mod.rs                # backend(), TaskHandle, Sleep, timeout, Instant
-    net.rs                # TcpStream halves, UdpSocket, resolve
+  rt/                     # The async runtime (tokio, smol, or wasm32): spawn, timers, sockets. Crate-private
+    mod.rs                # backend(), TaskHandle, Sleep, timeout, Instant, std_time
+    net.rs                # TcpStream halves, UdpSocket, resolve (tokio / smol only)
+    wasm.rs               # spawn_local + setTimeout backend (the `wasm` feature on wasm32)
     CLAUDE.md
 
   testing/                # Consumer test harness (feature-gated: `testing`)
@@ -167,6 +170,7 @@ crates/smb2-cli/          # The CLI crate -- see its CLAUDE.md
   tests/dry_run.rs        # Proves --dry-run opens no connection
   tests/e2e.rs            # The built binary against a live Samba fixture (#[ignore])
 
+examples/workers-probe/   # A Cloudflare Worker (wasm32, own workspace + lockfile): NTLM, list, read over a Workers socket
 benchmarks/               # Excluded from the workspace; each has its own lockfile
   smb/                    # Throughput vs the `smb` crate
   smb-listing/            # Directory-listing comparison
@@ -242,7 +246,7 @@ discards the late-arriving response silently. See `docs/connection-actor.md` for
 | Fork vs. rewrite     | Rewritten from scratch, not forked from smb-rs | smb-rs had almost no tests, a different architecture, and an MIT-only license |
 | Binary serialization | Hand-rolled `ReadCursor`/`WriteCursor`     | Full control, debuggable, no proc-macro dep                          |
 | Async strategy       | `dyn Transport` + `async_trait`            | Simpler public API than generics                                     |
-| Async runtime        | tokio (default) or smol, picked per call   | Every reactor call goes through crate-private `rt/`; see its CLAUDE.md |
+| Async runtime        | tokio (default) or smol, picked per call; wasm on wasm32 | Every reactor call goes through crate-private `rt/`; see its CLAUDE.md |
 | ID types             | Newtypes (`SessionId(u64)`, etc.)          | Zero-cost compile-time safety                                        |
 | Error handling       | Rich context + `is_retryable()` + NTSTATUS | mtp-rs style                                                         |
 | Transport trait      | Split send/receive                         | The writer task and the receiver task each own one half, so a send never waits on a receive |
@@ -325,7 +329,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 31. **A name the server hands back is only as good as the class that carried it** ✅ -- `Tree::resolve` and the `FileReader` / `FileWriter` opens ask for the stored name of what the server opened, and a policy check trusts that answer, so a wrong one is a security bug, not a cosmetic one. Class 48 (`FileNormalizedNameInformation`) is share-relative by spec and is trusted as sent. Class 18's name (`FileAllInformation`) is the fallback, and ❌ an EMPTY class 18 name means "not answered" (MS-SMB2 § 3.3.5.20.1: a server SHOULD send it empty, and current Windows does), never the share root; a filled one has an unspecified root, so only as many trailing components as the caller asked for are kept. A `STATUS_BUFFER_OVERFLOW` name is truncated and never used. The compound order also matters, because a server MAY fail every related op after a failed one (MS-SMB2 § 3.3.5.2.7.2): class 48 goes last so a refusal can't take the metadata or the fallback down, and the CLOSE it drags along gets a standalone one. Spans `client/resolve.rs` + `client/stream.rs` + `client/tree.rs`; see `client/CLAUDE.md` § Resolving names.
 
-32. **A runtime call outside `rt/` compiles everywhere and works only on tokio** ✅ -- `tokio::spawn`, `tokio::time::sleep` / `timeout`, `tokio::net`, and `tokio::io` all build fine in a default build and panic on a smol consumer with "there is no reactor running" (issue #1, which the README's "runtime-agnostic" claim had invited). ❌ So nothing outside `src/rt/` calls them; `tokio::sync` is the exception and stays everywhere, because it works on any executor. The guard is the smol-only build in `just clippy` and CI, which leaves tokio's `time`, `net`, `io-util`, and `rt` features off so a stray call fails to compile. Two semantics the rest of the crate leans on and `rt` preserves on smol: ❌ a dropped `TaskHandle` detaches and only `abort()` stops the task (smol's own `Task` cancels on drop, which would silently stop a connection's writer or receiver), and a dropped TCP write half shuts the write side down (pitfall 28's socket lifetime assumes it). Spans `rt/` + `client/connection.rs` + `transport/tcp.rs` + `auth/kerberos/kdc.rs`; see `src/rt/CLAUDE.md`.
+32. **A runtime call outside `rt/` compiles everywhere and works only on tokio** ✅ -- `tokio::spawn`, `tokio::time::sleep` / `timeout`, `tokio::net`, and `tokio::io` all build fine in a default build and panic on a smol consumer with "there is no reactor running" (issue #1, which the README's "runtime-agnostic" claim had invited). ❌ So nothing outside `src/rt/` calls them; `tokio::sync` is the exception and stays everywhere, because it works on any executor. The guard is the smol-only build in `just clippy` and CI, which leaves tokio's `time`, `net`, `io-util`, and `rt` features off so a stray call fails to compile. Two semantics the rest of the crate leans on and `rt` preserves on smol: ❌ a dropped `TaskHandle` detaches and only `abort()` stops the task (smol's own `Task` cancels on drop, which would silently stop a connection's writer or receiver), and a dropped TCP write half shuts the write side down (pitfall 28's socket lifetime assumes it). The wasm32 build adds a sibling trap: `std::time::Instant::now` and `SystemTime::now` build there and panic on first use, so the crate reads clocks through `rt::Instant` and `rt::std_time` (std's own on every other target). Spans `rt/` + `client/connection.rs` + `transport/tcp.rs` + `auth/kerberos/kdc.rs`; see `src/rt/CLAUDE.md`.
 
 33. **Windows fails an async op anywhere but last in a compound** ✅ -- Windows (Vista / Server 2008 and later) answers a compounded operation that needs asynchronous processing with `STATUS_INTERNAL_ERROR` unless it's the last one in the chain (MS-SMB2 § 3.3.5.2.7, product behavior note 266). A FLUSH always goes async there, so `write_file`'s CREATE + WRITE + FLUSH + CLOSE never flushed anything on Windows, silently, since a failed FLUSH is tolerated. The connection learns it from the first refusal (`flush_must_end_compound`, erased on revival), re-flushes that file with the FLUSH last, and from then on ends the write chain on the FLUSH and closes separately. Samba and the QNAP take the four-op chain. Spans `client/connection.rs` + `client/tree.rs`; see `client/CLAUDE.md` § Compound requests.
 

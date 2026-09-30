@@ -316,8 +316,9 @@ impl NtlmAuthenticator {
         }
 
         // Current time as Windows FILETIME (100-ns intervals since 1601-01-01)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        use crate::rt::std_time::SystemTime;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
         // UNIX epoch is 11644473600 seconds after FILETIME epoch
         (now.as_secs() + 11_644_473_600) * 10_000_000 + u64::from(now.subsec_nanos()) / 100

@@ -5,19 +5,28 @@
 //! pipeline's `tokio::select!` loop.
 //!
 //! Two implementations are provided:
-//! - [`TcpTransport`] -- direct TCP connection to an SMB server (port 445)
+//! - `TcpTransport` -- direct TCP connection to an SMB server (port 445).
+//!   Not in a build without sockets (the `wasm` runtime feature alone)
 //! - [`MockTransport`] -- canned responses for testing
+//!
+//! Any other way to reach a server (a Cloudflare Workers socket, a tunnel, a
+//! proxy) is a [`TransportFactory`] set on
+//! [`ClientConfig::transport_factory`](crate::ClientConfig::transport_factory).
 //!
 //! Most users don't need this module directly -- use [`SmbClient`](crate::SmbClient)
 //! which handles transport setup internally.
 
+mod connect;
 pub mod mock;
 pub mod progress;
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub mod tcp;
 
+pub use connect::{ConnectAttempt, ConnectOptions};
 pub use mock::MockTransport;
 pub use progress::{FrameProgress, ReceiveProgress, ReceiveSnapshot};
-pub use tcp::{ConnectAttempt, ConnectOptions, TcpTransport};
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub use tcp::TcpTransport;
 
 use std::sync::Arc;
 
@@ -59,6 +68,31 @@ pub trait TransportReceive: Send + Sync {
     fn receive_progress(&self) -> Option<Arc<ReceiveProgress>> {
         None
     }
+}
+
+/// Opens a connection to an SMB server some other way than this crate's own
+/// TCP: a Cloudflare Workers socket, a tunnel, a proxy, an in-process pipe.
+///
+/// Set on [`ClientConfig::transport_factory`](crate::ClientConfig::transport_factory),
+/// it is used for every connection the client opens: the first one, a
+/// reconnect, and a DFS target. Each call returns a fresh connection's two
+/// halves, and the halves frame messages themselves (a 4-byte header: one
+/// zero byte, then the length as 3 bytes big-endian; MS-SMB2 § 2.1), as
+/// [`TransportSend`] and [`TransportReceive`] say.
+///
+/// Required on a build without sockets (the `wasm` runtime feature alone),
+/// where a connect without one fails rather than panicking.
+///
+/// `Debug` because [`ClientConfig`](crate::ClientConfig) is.
+#[async_trait]
+pub trait TransportFactory: Send + Sync + std::fmt::Debug {
+    /// Connect to `addr`, the `host:port` the client was asked to reach:
+    /// [`ClientConfig::addr`](crate::ClientConfig::addr), or a DFS target's
+    /// address after [`dfs_target_overrides`](crate::ClientConfig::dfs_target_overrides).
+    async fn connect(
+        &self,
+        addr: &str,
+    ) -> Result<(Box<dyn TransportSend>, Box<dyn TransportReceive>)>;
 }
 
 /// A combined transport that can both send and receive.

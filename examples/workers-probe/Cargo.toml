@@ -1,0 +1,26 @@
+# A Cloudflare Worker that proves smb2 speaks SMB from inside workerd: connect, NTLM login, tree connect, a recursive
+# listing, one file read. Not published and not a workspace member: it only builds for wasm32, with its own lockfile.
+# See README.md for how to run it against the Docker fixture.
+[package]
+name = "smb2-workers-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+smb2 = { path = "../../crates/smb2", default-features = false, features = ["wasm"] }
+# `split` for the socket; `sync` for the async mutexes the transport halves sit behind.
+tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
+worker = "=0.8.7"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

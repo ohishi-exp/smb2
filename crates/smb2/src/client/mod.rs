@@ -149,6 +149,19 @@ pub struct ClientConfig {
     /// [`ConnectOptions`](crate::transport::ConnectOptions) for why a single deadline around
     /// `TcpStream::connect` is not enough.
     pub connect_options: Option<crate::transport::ConnectOptions>,
+    /// How to reach a server, when it isn't this crate's own TCP.
+    ///
+    /// `None` dials [`addr`](Self::addr) over TCP. `Some` hands every
+    /// connection the client opens to the factory instead: the first one, a
+    /// reconnect under [`auto_reconnect`](Self::auto_reconnect), and a DFS
+    /// target (with [`dfs_target_overrides`](Self::dfs_target_overrides)
+    /// already applied to its address). [`connect_options`](#structfield.connect_options)
+    /// is then unused; bounding the dial is the factory's call.
+    ///
+    /// Required in a build without sockets (smb2's `wasm` runtime feature
+    /// alone, on Cloudflare Workers for one), where a connect with `None` fails
+    /// with an [`Unsupported`](std::io::ErrorKind::Unsupported) I/O error.
+    pub transport_factory: Option<std::sync::Arc<dyn crate::transport::TransportFactory>>,
 }
 
 impl ClientConfig {
@@ -159,6 +172,58 @@ impl ClientConfig {
         self.connect_options
             .clone()
             .unwrap_or_else(|| crate::transport::ConnectOptions::with_timeout(self.timeout))
+    }
+
+    /// A connection to `addr`, opened the way this config says. See
+    /// [`transport_factory`](Self::transport_factory).
+    async fn open_connection(&self, addr: &str) -> Result<Connection> {
+        let (sender, receiver) = dial(
+            addr,
+            self.transport_factory.as_deref(),
+            &self.connect_options(),
+        )
+        .await?;
+        info!("connection: connected to {}", addr);
+        // ❌ Never `split(':')` for the name: see `host_of`.
+        Ok(Connection::from_transport(sender, receiver, host_of(addr)))
+    }
+}
+
+/// Open a transport to `addr`: through `factory` if there is one, over TCP
+/// otherwise. The one place that decides, so a connect, a reconnect, and a
+/// DFS target can't disagree about how a server is reached.
+async fn dial(
+    addr: &str,
+    factory: Option<&dyn crate::transport::TransportFactory>,
+    connect_options: &crate::transport::ConnectOptions,
+) -> Result<(
+    Box<dyn crate::transport::TransportSend>,
+    Box<dyn crate::transport::TransportReceive>,
+)> {
+    if let Some(factory) = factory {
+        return factory.connect(addr).await;
+    }
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    {
+        let transport = std::sync::Arc::new(
+            crate::transport::TcpTransport::connect_with(addr, connect_options.clone()).await?,
+        );
+        Ok((
+            Box::new(std::sync::Arc::clone(&transport)),
+            Box::new(transport),
+        ))
+    }
+    #[cfg(not(any(feature = "tokio", feature = "smol")))]
+    {
+        let _ = connect_options;
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "can't connect to {addr}: this build of smb2 has no sockets (only its `wasm` \
+                 runtime feature), so ClientConfig::transport_factory has to say how to reach \
+                 a server"
+            ),
+        )))
     }
 }
 
@@ -190,6 +255,7 @@ impl Default for ClientConfig {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            transport_factory: None,
         }
     }
 }
@@ -207,6 +273,7 @@ impl Default for ClientConfig {
 struct ClientReviver {
     addr: String,
     connect_options: crate::transport::ConnectOptions,
+    transport_factory: Option<std::sync::Arc<dyn crate::transport::TransportFactory>>,
     compression: bool,
     username: String,
     password: String,
@@ -227,6 +294,7 @@ impl ClientReviver {
         Self {
             addr,
             connect_options: config.connect_options(),
+            transport_factory: config.transport_factory.clone(),
             compression: config.compression,
             username: config.username.clone(),
             password: config.password.clone(),
@@ -243,14 +311,12 @@ impl connection::SessionReviver for ClientReviver {
         Box<dyn crate::transport::TransportSend>,
         Box<dyn crate::transport::TransportReceive>,
     )> {
-        let transport = std::sync::Arc::new(
-            crate::transport::TcpTransport::connect_with(&self.addr, self.connect_options.clone())
-                .await?,
-        );
-        Ok((
-            Box::new(std::sync::Arc::clone(&transport)),
-            Box::new(transport),
-        ))
+        dial(
+            &self.addr,
+            self.transport_factory.as_deref(),
+            &self.connect_options,
+        )
+        .await
     }
 
     async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
@@ -459,7 +525,7 @@ impl SmbClient {
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         debug!("smb_client: connecting to {}", config.addr);
 
-        let mut conn = Connection::connect_with(&config.addr, config.connect_options()).await?;
+        let mut conn = config.open_connection(&config.addr).await?;
         conn.set_compression_requested(config.compression);
         conn.negotiate().await?;
 
@@ -1182,7 +1248,7 @@ impl SmbClient {
         }
 
         // Create new connection to target.
-        let mut conn = Connection::connect_with(target_addr, self.config.connect_options()).await?;
+        let mut conn = self.config.open_connection(target_addr).await?;
         conn.set_compression_requested(self.config.compression);
         conn.negotiate().await?;
 
@@ -2046,6 +2112,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
 }
@@ -2207,6 +2274,7 @@ mod tests {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            transport_factory: None,
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -3803,6 +3871,7 @@ mod tests {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            transport_factory: None,
         };
 
         let client = SmbClient::from_parts(config, conn, session);

@@ -76,12 +76,26 @@ lz4_flex = "0.14"
 # Optional: `Serialize` derives on diagnostics types. Off by default.
 serde = { version = "1", optional = true, features = ["derive"] }
 
+# The `wasm` runtime backend (Cloudflare Workers and other single-threaded wasm32 hosts). Only built for a wasm32
+# target, so `--all-features` on a native target leaves them out. See `src/rt/CLAUDE.md`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = { version = "0.4", optional = true }
+gloo-timers = { version = "0.3", optional = true, features = ["futures"] }
+web-time = { version = "1", optional = true }
+# A JS timer is not `Send`; this makes it one on a host with a single thread, without `unsafe` in this crate.
+send_wrapper = { version = "0.6", optional = true }
+# `Crypto.getRandomValues` instead of the OS, which wasm32-unknown-unknown doesn't have.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
 [features]
 default = ["tokio"]
 # Runtime backends: at least one is required. With both on, a call made inside a tokio runtime runs on tokio and
 # everything else on smol. See `src/rt/CLAUDE.md`.
 tokio = ["tokio/net", "tokio/io-util", "tokio/rt", "tokio/time"]
 smol = ["dep:smol"]
+# The wasm32 backend: `wasm_bindgen_futures::spawn_local`, JS timers, and no sockets, so the caller brings a transport
+# through `ClientConfig::transport_factory`. Does nothing on a non-wasm32 target.
+wasm = ["dep:wasm-bindgen-futures", "dep:gloo-timers", "dep:web-time", "dep:send_wrapper"]
 testing = []  # Enables smb2::testing module for Docker-based test servers
 fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applications
 serde = ["dep:serde"]  # `Serialize` impls on `Diagnostics` types and the protocol enums they embed.

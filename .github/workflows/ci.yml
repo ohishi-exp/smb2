@@ -28,6 +28,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
@@ -41,6 +42,11 @@ jobs:
       # No tokio reactor compiled in: proves nothing outside `src/rt/` reaches for tokio's runtime.
       - name: Run clippy on a smol-only build
         run: cargo clippy -p smb2 --no-default-features --features smol --lib --examples -- -D warnings
+
+      # No sockets and no std clock: proves a wasm32 host (Cloudflare Workers) builds, and that nothing reaches for
+      # `std::time::Instant::now`, which builds there and panics on first use.
+      - name: Run clippy on a wasm32 build
+        run: cargo clippy -p smb2 --no-default-features --features wasm --target wasm32-unknown-unknown --lib -- -D warnings
 
       - name: Run tests
         run: cargo test

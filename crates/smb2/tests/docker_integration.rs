@@ -63,6 +63,7 @@ async fn guest_client() -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("SmbClient::connect to smb-guest failed")
@@ -81,6 +82,7 @@ async fn auth_client() -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("SmbClient::connect to smb-auth failed")
@@ -757,6 +759,7 @@ async fn auth_wrong_password_fails_cleanly() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await;
 
@@ -1777,6 +1780,7 @@ async fn encryption_client() -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("SmbClient::connect to smb-encryption failed")
@@ -1884,6 +1888,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -1982,6 +1987,7 @@ async fn flaky_error_is_clean_not_hang() {
             dfs_enabled: true,
             dfs_target_overrides: HashMap::new(),
             connect_options: None,
+            transport_factory: None,
         })
         .await
         {
@@ -2338,6 +2344,7 @@ async fn maxread_streaming_download() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -2408,6 +2415,7 @@ async fn dfs_client() -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: overrides,
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("SmbClient::connect to smb-dfs-root failed")
@@ -3979,6 +3987,7 @@ async fn maxread_file_writer() {
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -4037,6 +4046,7 @@ async fn signing_file_writer() {
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -4134,6 +4144,7 @@ async fn readonly_file_writer_error() {
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -4229,6 +4240,7 @@ async fn slow_file_writer_stress_100mb() {
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect failed");
@@ -4657,6 +4669,7 @@ async fn guest_reconnect_reestablishes_a_working_session() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect to smb-guest");
@@ -4759,6 +4772,7 @@ async fn guest_durable_handle_survives_a_reconnect_when_the_server_grants_one() 
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect to smb-guest");
@@ -4831,6 +4845,7 @@ async fn a_reconnect_to_a_signing_required_server_re_derives_working_keys() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect to smb-signing");
@@ -4891,6 +4906,7 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("connect to smb-encryption");
@@ -4953,6 +4969,7 @@ async fn weirdnames_client() -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .expect("SmbClient::connect to smb-weirdnames failed")
@@ -5540,6 +5557,7 @@ async fn dfs_namespace_client(addr: &str) -> SmbClient {
         dfs_enabled: true,
         dfs_target_overrides: overrides,
         connect_options: None,
+        transport_factory: None,
     })
     .await
     .unwrap_or_else(|e| panic!("SmbClient::connect to {addr} failed: {e}"))

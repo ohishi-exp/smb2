@@ -1058,7 +1058,7 @@ fn der_sequence(items: &[&[u8]]) -> Vec<u8> {
 ///
 /// Format: "YYYYMMDDHHmmssZ" (UTC).
 fn current_kerberos_time() -> (String, u32) {
-    use std::time::SystemTime;
+    use crate::rt::std_time::SystemTime;
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

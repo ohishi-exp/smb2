@@ -1,0 +1,9 @@
+# Local only: `wrangler dev` against the Docker fixture. Never deployed.
+name = "smb2-workers-probe"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "worker-build --release"

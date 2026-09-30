@@ -14,12 +14,21 @@
 //! raw bytes. No ASN.1 parsing beyond detecting error code 52 in the
 //! UDP-to-TCP fallback path.
 
+// A build without sockets keeps the config, the DER helpers, and the socketless
+// `send_to_kdc`, but none of the socket code the rest of this file serves.
+#![cfg_attr(
+    not(any(feature = "tokio", feature = "smol")),
+    allow(dead_code, unused_imports)
+)]
+
 use log::{debug, trace, warn};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+#[cfg(any(feature = "tokio", feature = "smol"))]
 use crate::rt::net::{TcpStream, UdpSocket};
+#[cfg(any(feature = "tokio", feature = "smol"))]
 use crate::rt::{sleep, timeout as with_timeout};
 
 /// Default Kerberos port (RFC 4120).
@@ -65,6 +74,26 @@ fn resolve_address(address: &str) -> String {
 ///
 /// UDP framing: raw DER bytes, no length prefix.
 /// TCP framing: 4-byte big-endian length prefix, then DER bytes.
+///
+/// A build without sockets (the `wasm` backend alone) has no KDC client:
+/// this fails with an [`Unsupported`](std::io::ErrorKind::Unsupported) I/O
+/// error, which is what a Kerberos login there comes back with.
+#[cfg(not(any(feature = "tokio", feature = "smol")))]
+pub async fn send_to_kdc(config: &KdcConfig, message: &[u8]) -> Result<Vec<u8>> {
+    let _ = message;
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "Kerberos needs a KDC connection, and this build has no sockets (only smb2's `wasm` \
+             runtime feature); can't reach {}. Use NTLM here.",
+            config.address
+        ),
+    )))
+}
+
+/// Send a Kerberos message to the KDC and receive the response. See the
+/// socketless definition for the other build.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub async fn send_to_kdc(config: &KdcConfig, message: &[u8]) -> Result<Vec<u8>> {
     let addr = resolve_address(&config.address);
     trace!("kdc: sending {} bytes to {}", message.len(), addr);
@@ -87,6 +116,7 @@ pub async fn send_to_kdc(config: &KdcConfig, message: &[u8]) -> Result<Vec<u8>> 
 }
 
 /// Send a Kerberos message via UDP.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 async fn send_udp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u8>> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         .await
@@ -137,6 +167,7 @@ async fn send_udp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
 }
 
 /// Send a Kerberos message via TCP.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 async fn send_tcp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u8>> {
     let mut last_err = None;
 
@@ -159,6 +190,7 @@ async fn send_tcp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
 }
 
 /// Single TCP send/receive attempt.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 async fn send_tcp_once(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u8>> {
     // Connect with timeout.
     let stream = with_timeout(timeout, TcpStream::connect_host(addr))

@@ -1275,6 +1275,7 @@ mod tests {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            transport_factory: None,
         };
         crate::SmbClient::from_parts(cfg, conn, session)
     }
