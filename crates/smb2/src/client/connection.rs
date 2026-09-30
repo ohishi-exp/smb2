@@ -15,7 +15,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// std's clock, or `performance.now()` on wasm32, where std's panics.
+use crate::rt::std_time::Instant;
 
 use futures_util::future::{select, Either};
 use log::{debug, error, info, trace, warn, Level};
@@ -33,7 +36,7 @@ struct Waiter {
     command: Command,
     /// When the waiter was inserted, which is BEFORE the bytes reach the
     /// transport. A request can sit here having never been sent.
-    registered_at: std::time::Instant,
+    registered_at: Instant,
     /// When the transport accepted the frame, or `None` while it is still
     /// queued for the writer task.
     ///
@@ -41,13 +44,13 @@ struct Waiter {
     /// and "sent 20 minutes ago, unanswered" are opposite diagnoses, and
     /// collapsing them into one timestamp is what sent three investigations
     /// after an innocent server.
-    sent_at: Option<std::time::Instant>,
+    sent_at: Option<Instant>,
     /// Last sign of life for this request: the send, then every interim
     /// STATUS_PENDING the server sends. Separate from the timestamps above
     /// because the response deadline wants "how long since the server last
     /// said anything", and a request still in the send queue has not asked
     /// it anything yet.
-    last_activity: std::time::Instant,
+    last_activity: Instant,
     /// The `AsyncId` the server assigned in its interim STATUS_PENDING, if it
     /// sent one.
     ///
@@ -516,7 +519,7 @@ struct WriteJob {
     /// For the log line and the [`Error::SendTimeout`]; the first sub-op's
     /// command for a compound.
     command: Command,
-    queued_at: std::time::Instant,
+    queued_at: Instant,
     done: oneshot::Sender<Result<()>>,
 }
 
@@ -624,7 +627,7 @@ async fn writer_loop(
         };
         let deadline = *strong.send_timeout.lock().unwrap();
         let len = job.bytes.len();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
 
         let result = match deadline {
             Some(d) => match rt::timeout(d, sender.send(&job.bytes)).await {
@@ -730,7 +733,7 @@ struct OutstandingSplit {
 }
 
 fn classify_outstanding(inner: &Inner, threshold: std::time::Duration) -> OutstandingSplit {
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let mut split = OutstandingSplit::default();
     for (id, w) in inner.waiters.lock().unwrap().iter() {
         let request = Outstanding {
@@ -1350,7 +1353,9 @@ use crate::msg::transform::{
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::rt;
-use crate::transport::{ReceiveProgress, TcpTransport, TransportReceive, TransportSend};
+#[cfg(any(feature = "tokio", feature = "smol"))]
+use crate::transport::TcpTransport;
+use crate::transport::{ReceiveProgress, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{
@@ -1677,7 +1682,7 @@ struct Inner {
     /// `None` rather than "the connection's birth" on purpose: a server that
     /// has never said anything has not proven anything, and the deadline
     /// extension must never be granted on an assumption.
-    last_frame_at: StdMutex<Option<std::time::Instant>>,
+    last_frame_at: StdMutex<Option<Instant>>,
     /// What the server has put on the wire so far, counted as it lands rather
     /// than when a frame completes. See [`Inbound`].
     inbound: StdMutex<Inbound>,
@@ -1687,7 +1692,7 @@ struct Inner {
     /// Every other clock here measures wall time, which silently assumes we
     /// were running to hear the silence we are measuring. This is the witness
     /// that says whether we were. See [`Inner::forgive_scheduling_stall`].
-    last_scheduled_at: StdMutex<std::time::Instant>,
+    last_scheduled_at: StdMutex<Instant>,
     /// How much server silence, with work outstanding, triggers an ECHO probe,
     /// or `None` to never probe. See `Connection::set_keepalive`.
     keepalive_after: StdMutex<Option<Duration>>,
@@ -1954,7 +1959,7 @@ impl Inner {
                 progress: Arc::new(ReceiveProgress::new()),
                 retired_bytes: 0,
             }),
-            last_scheduled_at: StdMutex::new(std::time::Instant::now()),
+            last_scheduled_at: StdMutex::new(Instant::now()),
             keepalive_after: StdMutex::new(Some(KEEPALIVE_AFTER)),
             long_poll_refresh: StdMutex::new(Some(LONG_POLL_REFRESH)),
             credits: CreditPool::new(),
@@ -2014,7 +2019,7 @@ impl Inner {
         let job = WriteJob {
             bytes: bytes.to_vec(),
             command,
-            queued_at: std::time::Instant::now(),
+            queued_at: Instant::now(),
             done: done_tx,
         };
         let queued_at = job.queued_at;
@@ -2093,7 +2098,7 @@ impl Inner {
     /// Also restarts the response deadline: the clock measures the server's
     /// silence, and the server has only now been asked.
     fn mark_sent(&self, msg_ids: &[MessageId]) {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let mut waiters = self.waiters.lock().unwrap();
         for id in msg_ids {
             if let Some(w) = waiters.get_mut(id) {
@@ -2196,7 +2201,7 @@ impl Inner {
             self.credits.available()
         );
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let deadline = started + self.credits.wait_timeout();
         let mut reserving = Box::pin(self.credits.reserve(charge));
         loop {
@@ -2223,7 +2228,7 @@ impl Inner {
                     let nothing_outstanding = self.waiters.lock().unwrap().is_empty();
                     if nothing_outstanding
                         || self.credits.can_never_fund(charge)
-                        || std::time::Instant::now() >= deadline
+                        || Instant::now() >= deadline
                     {
                         self.metrics
                             .credit_starvations
@@ -2238,7 +2243,7 @@ impl Inner {
 
     /// Record that the server put a frame on the wire just now.
     fn note_server_spoke(&self) {
-        *self.last_frame_at.lock().unwrap() = Some(std::time::Instant::now());
+        *self.last_frame_at.lock().unwrap() = Some(Instant::now());
     }
 
     /// Start reading inbound counts from a new transport's counter, retiring
@@ -2278,7 +2283,7 @@ impl Inner {
     /// alongside, because `last_frame_at` is the one the stall correction and
     /// a revival adjust. Taking the later of the two keeps both: a corrected
     /// reading sits ahead of any byte that landed before the stall.
-    fn last_heard(&self) -> Option<std::time::Instant> {
+    fn last_heard(&self) -> Option<Instant> {
         let progress = Arc::clone(&self.inbound.lock().unwrap().progress);
         let byte_at = progress.snapshot().last_byte_at;
         let mut last = self.last_frame_at.lock().unwrap();
@@ -2293,7 +2298,7 @@ impl Inner {
     /// How long since the server last said anything, or `None` if it never
     /// has.
     fn server_silent_for(&self) -> Option<Duration> {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         self.last_heard().map(|t| now.saturating_duration_since(t))
     }
 
@@ -2312,7 +2317,7 @@ impl Inner {
     /// case, and conflating the two is the misdiagnosis the `sent_at` split
     /// exists to prevent.
     fn quiet_for(&self) -> Option<Duration> {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let oldest_sent = {
             let waiters = self.waiters.lock().unwrap();
             waiters.values().filter_map(|w| w.sent_at).min()?
@@ -2360,7 +2365,7 @@ impl Inner {
         // armed: "we were not running" is a fact about this process, and
         // `set_keepalive(None)` says nothing about it either way.
         let after = (*self.keepalive_after.lock().unwrap()).unwrap_or(KEEPALIVE_AFTER);
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let stall = {
             let mut witness = self.last_scheduled_at.lock().unwrap();
             let gap = now
@@ -2372,7 +2377,7 @@ impl Inner {
         // Shifting forward, rather than resetting to now, keeps whatever the
         // clocks legitimately read BEFORE the stall: a request the server had
         // already owed us for 10 s is still 10 s overdue afterwards.
-        let shift = |t: &mut std::time::Instant| *t = t.checked_add(stall).unwrap_or(now);
+        let shift = |t: &mut Instant| *t = t.checked_add(stall).unwrap_or(now);
         // Folds in the latest partial-frame byte first, so the shift starts
         // from the last thing the server actually said.
         self.last_heard();
@@ -2408,7 +2413,7 @@ impl Inner {
     fn loops_are_behind(&self) -> bool {
         let after = (*self.keepalive_after.lock().unwrap()).unwrap_or(KEEPALIVE_AFTER);
         let witness = *self.last_scheduled_at.lock().unwrap();
-        std::time::Instant::now()
+        Instant::now()
             .saturating_duration_since(witness)
             .saturating_sub(Self::keepalive_tick(after))
             >= after
@@ -2489,7 +2494,7 @@ impl Inner {
     /// of those, right at the start, and a clock that restarted there would
     /// measure the same thing while claiming to measure registration age.
     fn waiter_sent_age(&self, msg_id: MessageId) -> Option<Duration> {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         self.waiters
             .lock()
             .unwrap()
@@ -2507,7 +2512,7 @@ impl Inner {
     /// How long `msg_id` has gone without a sign of life, or `None` if it is
     /// no longer outstanding (its response has been routed).
     fn waiter_idle_for(&self, msg_id: MessageId) -> Option<Duration> {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         self.waiters
             .lock()
             .unwrap()
@@ -2719,6 +2724,11 @@ impl Connection {
     /// address the name resolves to gets a chance inside it. To tune how those
     /// attempts are spread, use
     /// [`connect_with`](Self::connect_with).
+    ///
+    /// Not in a build without sockets (the `wasm` runtime feature alone):
+    /// there, open the transport yourself and use
+    /// [`from_transport`](Self::from_transport).
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub async fn connect(addr: &str, timeout: Duration) -> Result<Self> {
         Self::connect_with(
             addr,
@@ -2729,6 +2739,7 @@ impl Connection {
 
     /// [`connect`](Self::connect) with the connect budget under the caller's
     /// control. See [`ConnectOptions`](crate::transport::ConnectOptions).
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub async fn connect_with(addr: &str, opts: crate::transport::ConnectOptions) -> Result<Self> {
         // ❌ Never `split(':')` here: it reads an IPv6 literal as its first
         // group (`[::1]:445` → `[`), and this name goes out as the server half
@@ -2802,7 +2813,7 @@ impl Connection {
 
         let mut guard = self.register_waiter(msg_id, Command::Negotiate)?;
 
-        let rtt_start = std::time::Instant::now();
+        let rtt_start = Instant::now();
         self.inner
             .send_and_count(&req_bytes, Command::Negotiate)
             .await?;
@@ -4279,7 +4290,7 @@ impl Connection {
             return Err(Error::Disconnected);
         }
         let (tx, rx) = oneshot::channel();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         waiters.insert(
             msg_id,
             Waiter {
@@ -4322,7 +4333,7 @@ impl Connection {
     /// The same data the sweeper warns from, for consumers that would rather
     /// render it than read logs.
     pub fn outstanding_requests(&self) -> Vec<crate::client::diagnostics::OutstandingRequest> {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let mut out: Vec<_> = self
             .inner
             .waiters
@@ -5890,7 +5901,7 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         // response deadline (MS-SMB2 § 3.2.5.1.5). Without this, a legitimately
         // slow operation the server has acknowledged would be timed out.
         if let Some(waiter) = inner.waiters.lock().unwrap().get_mut(&header.message_id) {
-            waiter.last_activity = std::time::Instant::now();
+            waiter.last_activity = Instant::now();
             // Remember the id a CANCEL for this request will have to carry
             // (MS-SMB2 § 3.2.4.24). The interim response is the only place the
             // server ever states it.

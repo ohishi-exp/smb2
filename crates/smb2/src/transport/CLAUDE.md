@@ -1,13 +1,15 @@
 # Transport -- send/receive abstraction
 
-Split transport traits for SMB2 message I/O. Two implementations: TCP and mock.
+Split transport traits for SMB2 message I/O. Two implementations: TCP and mock. Anything else (a Cloudflare Workers
+socket, a tunnel) comes from the consumer through a `TransportFactory` on `ClientConfig::transport_factory`.
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `TransportSend`, `TransportReceive`, `Transport` traits |
-| `tcp.rs` | `TcpTransport` -- direct TCP to port 445, handles framing |
+| `mod.rs` | `TransportSend`, `TransportReceive`, `Transport`, `TransportFactory` traits |
+| `connect.rs` | `ConnectOptions`, `ConnectAttempt` -- in every build, since `ClientConfig` and `Error` carry them |
+| `tcp.rs` | `TcpTransport` -- direct TCP to port 445, handles framing. Only with a socket backend (`tokio` / `smol`) |
 | `progress.rs` | `ReceiveProgress` -- live byte counts for a frame still arriving |
 | `mock.rs` | `MockTransport` -- FIFO response queue for testing |
 
@@ -113,3 +115,20 @@ consequences worth knowing before changing either side:
   writer task is what guarantees no caller can cancel it — it does cancel on its own send deadline, and tears the
   connection down when it does, for exactly this reason.
 - ❌ **Don't call `TransportSend::send` from anywhere else in the client.** Go through `Inner::send_and_count`.
+
+## Transport factories
+
+`TransportFactory::connect(addr)` returns a fresh connection's two halves, and `client::dial` is the one place that
+picks it over TCP, so the first connect, a reconnect (`ClientReviver::dial`), and a DFS target (`ensure_connection`) all
+reach a server the same way.
+
+- **Decision:** a factory on `ClientConfig`, not a parameter to `SmbClient::connect`. **Why:** a reconnect and a DFS
+  target dial long after the call that set things up returned, from a `ClientReviver` holding a snapshot of the config.
+- **Decision:** the factory frames messages itself, like `TcpTransport`. **Why:** it's the `TransportSend` /
+  `TransportReceive` contract every transport already has, and the probe's framing is 30 lines.
+- **Gotcha:** a transport over a JS socket (`worker::Socket`) isn't `Send`, and these traits require it. The
+  consumer wraps it (`worker::send::SendWrapper` / `SendFuture`, see `examples/workers-probe`); the traits keep their
+  bounds because the tokio and smol backends move connections between threads.
+- `receive_progress` is optional. A factory transport that returns `None` gets whole-frame liveness only, which is
+  fine until a single response takes longer than the response deadline to trickle in (root `AGENTS.md` pitfall 26).
+

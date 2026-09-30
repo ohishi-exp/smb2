@@ -13,7 +13,10 @@
 //! what they say is not.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// std's clock, or `performance.now()` on wasm32, where std's panics.
+use crate::rt::std_time::Instant;
 
 /// "No frame is arriving", in [`ReceiveProgress::frame_len`].
 const NO_FRAME: u64 = u64::MAX;

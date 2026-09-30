@@ -61,6 +61,9 @@ clippy:
     @# on a smol user. Lib and examples only: the test suite is written against tokio's paused clock.
     @echo "[*] Running clippy on a smol-only build..."
     @cargo clippy -p smb2 --no-default-features --features smol --lib --examples --quiet -- -D warnings
+    @# No sockets, JS timers: the build a Cloudflare Worker uses. Needs `rustup target add wasm32-unknown-unknown`.
+    @echo "[*] Running clippy on a wasm32 build..."
+    @cargo clippy -p smb2 --no-default-features --features wasm --target wasm32-unknown-unknown --lib --quiet -- -D warnings
     @echo "[+] Clippy passed"
 
 # Run tests

@@ -47,6 +47,16 @@
 //! smb2 = { version = "0.26", default-features = false, features = ["smol"] }
 //! ```
 //!
+//! On a single-threaded `wasm32` host (Cloudflare Workers), the `wasm`
+//! feature runs tasks on the host's event loop and timers on `setTimeout`.
+//! There are no sockets there, so the connection comes from you, through
+//! [`ClientConfig::transport_factory`]. Kerberos needs its own sockets and
+//! isn't available in that build; NTLM is:
+//!
+//! ```toml
+//! smb2 = { version = "0.28", default-features = false, features = ["wasm"] }
+//! ```
+//!
 //! # Modules
 //!
 //! - [`client`] -- High-level API: [`SmbClient`], [`Tree`], [`Pipeline`].

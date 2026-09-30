@@ -5,6 +5,17 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **smb2 runs on Cloudflare Workers and other single-threaded wasm32 hosts.** A third runtime feature, `wasm`, spawns tasks with `wasm_bindgen_futures::spawn_local` and times them with JS `setTimeout`; it only does anything on a `wasm32` target, so `--all-features` elsewhere is unaffected. There are no sockets there, so you bring the connection: `ClientConfig::transport_factory` takes a `TransportFactory` that opens one (a Workers `connect()` socket, a VPC binding, a tunnel) and hands back its two halves, and every connection the client opens goes through it: the first one, a reconnect, and a DFS target. It works on native builds too, for a proxy or an in-process pipe. `examples/workers-probe` is a Worker that connects, logs in with NTLM, lists a share, and reads a file, run against the Docker fixture with `wrangler dev`. Kerberos isn't available there (its KDC client needs sockets), and asking for it fails with an `Unsupported` I/O error rather than panicking.
+
+### Changed
+
+- **`ConnectOptions` and `ConnectAttempt` live in `smb2::transport`**, re-exported from `smb2::transport::tcp` where they were, so existing paths still compile. They moved so a build without sockets keeps them.
+- **`ClientConfig` has a new field, `transport_factory`.** A struct literal that spells out every field needs `transport_factory: None`; one ending in `..Default::default()` needs nothing.
+
 ## [0.27.0] - 2026-09-29
 
 ### Breaking

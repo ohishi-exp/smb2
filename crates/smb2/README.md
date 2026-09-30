@@ -18,7 +18,7 @@ we have more control to reach even better speeds.
 
 - Cross-compile without system lib headaches (no `libsmbclient`, no `-sys` crates)
 - Pipelined I/O by default, not as an afterthought
-- Async, on tokio or smol (and, through smol, any other executor)
+- Async, on tokio or smol (and, through smol, any other executor), or on Cloudflare Workers (wasm32)
 - Works anywhere Rust compiles
 
 ## What it does
@@ -332,6 +332,16 @@ smol = "2"
 
 With both features on, each call runs on tokio when it's made inside a tokio runtime and on smol otherwise. smb2 still
 uses tokio's channels and semaphores either way; they work on any executor.
+
+On Cloudflare Workers, or any other single-threaded `wasm32` host, use the `wasm` feature. It has no sockets of its own,
+so set `ClientConfig::transport_factory` to something that opens one (a Workers `connect()` socket, say) and frames SMB2
+messages over it. NTLM works there; Kerberos, which needs sockets of its own to reach the KDC, doesn't.
+`examples/workers-probe` in the repository is a complete Worker.
+
+```toml
+[dependencies]
+smb2 = { version = "0.28", default-features = false, features = ["wasm"] }
+```
 
 ## API overview
 

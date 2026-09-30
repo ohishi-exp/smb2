@@ -21,7 +21,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// std's clock, or `performance.now()` on wasm32, where std's panics.
+use crate::rt::std_time::Instant;
 
 use log::{debug, trace};
 

@@ -1,5 +1,6 @@
 //! The async runtime underneath the client: spawning tasks, timers, and
-//! sockets, on tokio or on smol.
+//! sockets, on tokio or on smol, or tasks and timers (no sockets) on a
+//! single-threaded wasm32 host with the `wasm` feature.
 //!
 //! Everything in the crate that needs a running reactor goes through here.
 //! What doesn't need one stays plain tokio on purpose: `tokio::sync`
@@ -18,14 +19,27 @@
 //! connection's tasks, timers, and socket are all created from the same
 //! context.
 //!
+//! **On wasm32 with the `wasm` feature, the wasm backend is the only one.**
+//! Tokio's and smol's reactors don't build there, and there is nothing to
+//! decide. It has no sockets: [`net`] doesn't exist in that build, and the
+//! caller dials through `ClientConfig::transport_factory` instead.
+//!
 //! See `CLAUDE.md` beside this file for the traps, the task-handle one first.
 
-#[cfg(not(any(feature = "tokio", feature = "smol")))]
+#[cfg(not(any(
+    feature = "tokio",
+    feature = "smol",
+    all(feature = "wasm", target_arch = "wasm32")
+)))]
 compile_error!(
-    "smb2 needs an async runtime: enable its `tokio` feature (on by default) or its `smol` feature"
+    "smb2 needs an async runtime: enable its `tokio` feature (on by default) or its `smol` feature, \
+     or on a wasm32 target its `wasm` feature"
 );
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod net;
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+mod wasm;
 
 use std::future::Future;
 use std::pin::{pin, Pin};
@@ -41,11 +55,30 @@ use futures_util::future::{select, Either};
 /// it (`download_tests` and `upload_tests` time everything that way). A
 /// smol-only build has no tokio clock, so it is std's there. Both have the
 /// same API, apart from the conversion [`to_std`] covers.
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", not(all(feature = "wasm", target_arch = "wasm32"))))]
 pub(crate) type Instant = tokio::time::Instant;
 /// The crate's clock. See the `tokio`-feature definition.
-#[cfg(not(feature = "tokio"))]
+#[cfg(not(any(feature = "tokio", all(feature = "wasm", target_arch = "wasm32"))))]
 pub(crate) type Instant = std::time::Instant;
+/// The crate's clock. See the `tokio`-feature definition. On wasm32 it is
+/// `performance.now()`, because std's `Instant::now` panics there.
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub(crate) type Instant = web_time::Instant;
+
+/// std's clocks, for the timestamps no [`Sleep`] is compared against
+/// (liveness bookkeeping, log throughput, TTLs, NTLM's timestamp).
+///
+/// std's own everywhere except wasm32, where `Instant::now` and
+/// `SystemTime::now` panic, so these are `web-time`'s (`performance.now()`
+/// and `Date.now()`), which have the same API. ❌ Don't `use std::time::Instant`
+/// or call `std::time::SystemTime::now` outside tests: it builds for wasm32
+/// and panics there on first use.
+pub(crate) mod std_time {
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
+    pub(crate) use std::time::{Instant, SystemTime};
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    pub(crate) use web_time::{Instant, SystemTime};
+}
 
 /// `instant` as std's clock, for an API that wants one.
 #[cfg(feature = "smol")]
@@ -70,6 +103,9 @@ pub(crate) enum Backend {
     /// under any executor, `smol::block_on` and `futures::executor` included.
     #[cfg(feature = "smol")]
     Smol,
+    /// A single-threaded wasm32 host: `spawn_local` and JS timers.
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    Wasm,
 }
 
 /// What a tokio-only build says when it is called outside a tokio runtime.
@@ -87,7 +123,15 @@ const NO_TOKIO_RUNTIME: &str = "smb2 was called outside a tokio runtime, and it 
 /// In a build with only the `tokio` feature, when there is no tokio runtime
 /// in reach.
 pub(crate) fn backend() -> Backend {
-    #[cfg(all(feature = "tokio", feature = "smol"))]
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    {
+        Backend::Wasm
+    }
+    #[cfg(all(
+        feature = "tokio",
+        feature = "smol",
+        not(all(feature = "wasm", target_arch = "wasm32"))
+    ))]
     {
         if tokio::runtime::Handle::try_current().is_ok() {
             Backend::Tokio
@@ -95,14 +139,22 @@ pub(crate) fn backend() -> Backend {
             Backend::Smol
         }
     }
-    #[cfg(all(feature = "tokio", not(feature = "smol")))]
+    #[cfg(all(
+        feature = "tokio",
+        not(feature = "smol"),
+        not(all(feature = "wasm", target_arch = "wasm32"))
+    ))]
     {
         if tokio::runtime::Handle::try_current().is_err() {
             panic!("{NO_TOKIO_RUNTIME}");
         }
         Backend::Tokio
     }
-    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    #[cfg(all(
+        feature = "smol",
+        not(feature = "tokio"),
+        not(all(feature = "wasm", target_arch = "wasm32"))
+    ))]
     {
         Backend::Smol
     }
@@ -128,6 +180,10 @@ enum TaskInner {
     /// `None` once aborted, so `Drop` has nothing left to detach.
     #[cfg(feature = "smol")]
     Smol(Option<smol::Task<()>>),
+    /// `spawn_local` hands back nothing, so the task runs inside an
+    /// `Abortable` and this is its switch. Dropping it detaches.
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    Wasm(futures_util::future::AbortHandle),
 }
 
 impl TaskHandle {
@@ -145,6 +201,8 @@ impl TaskHandle {
             // `Drop` nothing to detach.
             #[cfg(feature = "smol")]
             TaskInner::Smol(task) => drop(task.take()),
+            #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+            TaskInner::Wasm(handle) => handle.abort(),
         }
     }
 }
@@ -161,6 +219,9 @@ impl Drop for TaskHandle {
                     task.detach();
                 }
             }
+            // Dropping an `AbortHandle` leaves the task running.
+            #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+            TaskInner::Wasm(_) => {}
         }
     }
 }
@@ -169,7 +230,9 @@ impl Drop for TaskHandle {
 ///
 /// On smol that is smol's global executor, which runs on threads of its own
 /// (`SMOL_THREADS`, one by default), so the task makes progress whatever
-/// executor the caller is on.
+/// executor the caller is on. On wasm it is the host's microtask queue
+/// (`spawn_local`); `Send` is still required so the one set of task bodies
+/// builds on every backend.
 pub(crate) fn spawn<F>(future: F) -> TaskHandle
 where
     F: Future<Output = ()> + Send + 'static,
@@ -179,6 +242,8 @@ where
         Backend::Tokio => TaskHandle(TaskInner::Tokio(tokio::spawn(future))),
         #[cfg(feature = "smol")]
         Backend::Smol => TaskHandle(TaskInner::Smol(Some(smol::spawn(future)))),
+        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        Backend::Wasm => TaskHandle(TaskInner::Wasm(wasm::spawn(future))),
     }
 }
 
@@ -235,6 +300,8 @@ enum SleepInner {
     Tokio(Pin<Box<tokio::time::Sleep>>),
     #[cfg(feature = "smol")]
     Smol(smol::Timer),
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    Wasm(wasm::Sleep),
 }
 
 impl Future for Sleep {
@@ -246,6 +313,8 @@ impl Future for Sleep {
             SleepInner::Tokio(sleep) => sleep.as_mut().poll(cx),
             #[cfg(feature = "smol")]
             SleepInner::Smol(timer) => Pin::new(timer).poll(cx).map(|_| ()),
+            #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+            SleepInner::Wasm(sleep) => Pin::new(sleep).poll(cx),
         }
     }
 }
@@ -264,6 +333,8 @@ pub(crate) fn sleep_until(deadline: Instant) -> Sleep {
         )))),
         #[cfg(feature = "smol")]
         Backend::Smol => Sleep(SleepInner::Smol(smol::Timer::at(to_std(deadline)))),
+        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        Backend::Wasm => Sleep(SleepInner::Wasm(wasm::Sleep::until(deadline))),
     }
 }
 

@@ -1,14 +1,18 @@
 # rt: the async runtime underneath the client
 
-Everything that needs a running reactor (spawning, timers, sockets) goes through this module, on tokio or smol.
-Crate-private. The public face is two Cargo features, `tokio` (default) and `smol`, and the crate docs' "Async
-runtime" section.
+Everything that needs a running reactor (spawning, timers, sockets) goes through this module, on tokio or smol, or on a
+single-threaded wasm32 host (Cloudflare Workers). Crate-private. The public face is three Cargo features, `tokio`
+(default), `smol`, and `wasm`, and the crate docs' "Async runtime" section.
 
 ## Files
 
 - `mod.rs`: `backend()`, `spawn` / `TaskHandle`, `sleep` / `sleep_until` / `Sleep`, `timeout` / `timeout_at` /
   `Elapsed`, `yield_now`, and `Instant`
-- `net.rs`: `resolve`, `TcpStream` (split into `ReadHalf` / `WriteHalf`), `UdpSocket` (the KDC client's)
+- `net.rs`: `resolve`, `TcpStream` (split into `ReadHalf` / `WriteHalf`), `UdpSocket` (the KDC client's). Only with
+  `tokio` or `smol`: the wasm build has no sockets
+- `wasm.rs`: the wasm32 backend's `spawn` (`spawn_local` inside an `Abortable`) and `Sleep` (`setTimeout`, re-armed
+  until the clock passes the deadline)
+- `mod.rs` also has `std_time`: std's `Instant` / `SystemTime`, or `web-time`'s on wasm32
 - `tests.rs`: each contract scenario is one async fn, run once under `#[tokio::test]` and once under `smol::block_on`
 - The end-to-end proof lives elsewhere: `client/smol_runtime_tests.rs` (real loopback sockets, no tokio runtime) and
   `tests/smol_integration.rs` (Docker Samba, smol-only build)
@@ -24,6 +28,9 @@ created from the same context, so one connection never mixes the two.
   by default), so the smol backend also works under `futures::executor::block_on`, `pollster`, and so on.
 - A tokio-only build called outside a tokio runtime panics with a message naming the `smol` feature. Tokio's own
   panic only names tokio, which is what sent issue #1's reporter looking in the wrong place.
+- **On wasm32 with `wasm` on, it's always the wasm backend.** Tokio's and smol's reactors don't build there, so there is
+  nothing to decide. `wasm` on any other target does nothing (it only pulls in wasm32-only dependencies), so
+  `--all-features` and docs.rs are unaffected.
 
 ## Gotchas
 
@@ -56,11 +63,30 @@ created from the same context, so one connection never mixes the two.
 - `Sleep` boxes tokio's timer so `Sleep` is `Unpin` and races with `futures_util::future::select` after a plain
   `pin!`. One allocation per timer is noise next to the frame each one guards.
 
+- ❌ **Nothing outside tests may call `std::time::Instant::now` or `SystemTime::now`.** On wasm32-unknown-unknown both
+  build and panic on first use. Use `rt::Instant` for anything a timer compares against and `rt::std_time::{Instant,
+  SystemTime}` for the rest (liveness bookkeeping, log throughput, DFS TTLs, the NTLM and Kerberos timestamps).
+  `std_time` is std's own on every other target, so native behavior doesn't move. The wasm clippy build in CI catches a
+  type mismatch, not a stray `std::time::Instant::now()` on its own, so grep for it.
+- **wasm tasks are `Send` anyway.** `spawn` keeps its `Send` bound on every backend so one set of task bodies builds
+  everywhere. The one wasm type that isn't `Send`, gloo's `TimeoutFuture`, sits in `send_wrapper::SendWrapper`, which
+  panics if it is ever touched from another thread instead of misbehaving, and needs no `unsafe` here. A consumer's JS
+  socket has the same problem one level up; see `transport/CLAUDE.md` § Transport factories.
+- **The wasm `Sleep` re-arms until the clock agrees.** `setTimeout` takes a signed 32-bit millisecond delay and fires at
+  once for anything bigger, and `Duration::MAX` means "never" here, so one timer can't express a far deadline. Firing
+  is a reason to look at the clock, not a verdict. Measured in `wrangler dev` (workerd, 2026-09-30): 10 / 100 / 1000 ms
+  timers advance `performance.now()` by 13 ms / 100 ms / 1.002 s, and the connection's 1 s keepalive tick and 20 s / 30 s
+  stale-request warnings fire on schedule.
+- **No wasm test harness.** The contract tests run on tokio and smol; the wasm backend is compile-checked (CI clippy)
+  and exercised end to end by `examples/workers-probe` under `wrangler dev`.
+
 ## Decisions
 
 - **Decision:** an internal backend switch, not a public `Runtime` trait. **Why:** the runtimes that fit this crate's
   design (`Send` tasks that migrate between threads, borrowed read buffers) are tokio and smol, and smol already
-  covers "any executor". The io_uring runtimes (glommio, monoio, compio) are thread-per-core with owned buffers and
+  covers "any executor". wasm is the third arm rather than a reason for the trait: it needs only a spawner and a timer,
+  and the sockets it lacks come in through `ClientConfig::transport_factory`, a public seam that already existed in
+  spirit (`Connection::from_transport`). The io_uring runtimes (glommio, monoio, compio) are thread-per-core with owned buffers and
   would need deeper changes than a trait. A public trait would also hand consumers the detach-versus-cancel trap
   above. If a real third runtime shows up, making this module's surface a public trait is additive.
 - **Decision:** `tokio::sync` stays a hard dependency. **Why:** it's executor-independent, and swapping it for
